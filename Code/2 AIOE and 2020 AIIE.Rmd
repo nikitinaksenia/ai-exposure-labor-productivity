@@ -1,0 +1,594 @@
+---
+title: "AIOE and 2020 AIIE"
+date: "2026-04-26"
+output: pdf_document
+---
+
+`
+```{r}
+
+library(haven)       # read/write Stata .dta files
+library(tidyverse)   # dplyr, tidyr, ggplot2, stringr, etc.
+library(sandwich)    # vcovCL for clustered standard errors
+library(lmtest)      # coeftest to display results with robust SEs
+
+# Binscatter helper
+binscatter_data <- function(data, xvar, yvar, groupvar = NULL, nbins = 20) {
+  cols <- c(x = xvar, y = yvar)
+  if (!is.null(groupvar)) cols <- c(cols, group = groupvar)
+  df <- data %>%
+    select(all_of(cols)) %>%
+    drop_na(x, y)
+
+  if (!is.null(groupvar)) {
+    df <- df %>%
+      group_by(group) %>%
+      mutate(bin = ntile(x, nbins)) %>%
+      group_by(group, bin) %>%
+      summarise(x = mean(x), y = mean(y), .groups = "drop")
+  } else {
+    df <- df %>%
+      mutate(bin = ntile(x, nbins)) %>%
+      group_by(bin) %>%
+      summarise(x = mean(x), y = mean(y), .groups = "drop")
+  }
+  df
+}
+
+
+# PART 1 — Build AIOE scores for each sample
+
+samples <- c("binary_all", "only_generatingimages", "only_languagemodeling")
+
+sample_results <- list()  # store intermediate results
+
+for (sample in samples) {
+
+  
+  app_var <- read_dta("../Data/Source data/AIOE and AIIE source files/application_variations.dta")
+
+  app_var <- app_var %>%
+    select(applications, all_of(sample)) %>%
+    rename(score = !!sample)
+
+  mturk <- read_dta("../Data/Source data/AIOE and AIIE source files/mturk_mapping_matrix.dta")
+  merged <- app_var %>%
+    left_join(mturk, by = "applications")
+
+  ability_cols <- setdiff(names(mturk), "applications")
+
+  merged <- merged %>%
+    mutate(across(all_of(ability_cols), ~ score * .x))
+
+  mat <- merged %>%
+    select(all_of(ability_cols)) %>%
+    t() %>%
+    as.data.frame()
+
+  mat$onet_element <- rownames(mat)
+  rownames(mat) <- NULL
+
+  v_cols <- setdiff(names(mat), "onet_element")
+  mat$onet_score <- rowSums(mat[, v_cols], na.rm = TRUE)
+
+  onet_scores <- mat %>% select(onet_element, onet_score)
+
+  # Load O*NET abilities data 
+  abilities <- read_dta("../Data/Source data/AIOE and AIIE source files/abilities_2020.dta")
+
+  # Standardising element name to match
+  abilities <- abilities %>%
+    rename(onet_element = elementname) %>%
+    mutate(onet_element = str_to_lower(onet_element),
+           onet_element = str_replace_all(onet_element, "[ -]", ""))
+
+  # Creating scaled scores 
+  abilities <- abilities %>%
+    mutate(
+      scale_importance = if_else(scaleid == "IM", datavalue / 5, NA_real_),
+      scale_level      = if_else(scaleid == "LV", datavalue / 7, NA_real_)
+    ) %>%
+    group_by(onetsoccode, elementid) %>%
+    mutate(
+      level_scaled      = max(scale_level,      na.rm = TRUE),
+      importance_scaled  = max(scale_importance, na.rm = TRUE)
+    ) %>%
+    ungroup() %>%
+    mutate(scalar = level_scaled * importance_scaled)
+
+  abilities <- abilities %>%
+    select(onetsoccode, onet_element, importance_scaled, level_scaled, scalar) %>%
+    distinct()
+
+  # Occupation-level base sums 
+  abilities <- abilities %>%
+    group_by(onetsoccode) %>%
+    mutate(
+      ability_base    = sum(scalar,            na.rm = TRUE),
+      importance_base = sum(importance_scaled,  na.rm = TRUE),
+      level_base      = sum(level_scaled,       na.rm = TRUE)
+    ) %>%
+    ungroup()
+
+ 
+  abilities <- abilities %>%
+    left_join(onet_scores, by = "onet_element")
+
+  abilities <- abilities %>%
+    mutate(
+      wtd_element_impact     = scalar            * onet_score,
+      imp_wtd_element_impact = importance_scaled  * onet_score,
+      lvl_element_impact     = level_scaled       * onet_score
+    )
+
+  # Sum by occupation 
+  abilities <- abilities %>%
+    group_by(onetsoccode) %>%
+    mutate(
+      total_weighted_impact = sum(wtd_element_impact,     na.rm = TRUE),
+      imp_weighted_impact   = sum(imp_wtd_element_impact, na.rm = TRUE),
+      lvl_weighted_impact   = sum(lvl_element_impact,     na.rm = TRUE)
+    ) %>%
+    ungroup()
+
+ 
+  occ_data <- abilities %>%
+    select(onetsoccode, ability_base, importance_base, level_base,
+           total_weighted_impact, imp_weighted_impact, lvl_weighted_impact) %>%
+    distinct()
+
+  # Map to BLS SOC codes 
+  occ_data <- occ_data %>%
+    mutate(onet_soc_map = str_sub(onetsoccode, 1, 7))
+
+  occ_data <- occ_data %>%
+    group_by(onet_soc_map) %>%
+    mutate(
+      avg_wtd_impact      = mean(total_weighted_impact, na.rm = TRUE),
+      avg_imp_wtd_impact  = mean(imp_weighted_impact,   na.rm = TRUE),
+      avg_lvl_wtd_impact  = mean(lvl_weighted_impact,   na.rm = TRUE),
+      avg_ability_base    = mean(ability_base,           na.rm = TRUE),
+      avg_importance_base = mean(importance_base,        na.rm = TRUE),
+      avg_level_base      = mean(level_base,             na.rm = TRUE)
+    ) %>%
+    ungroup()
+
+  occ_data <- occ_data %>%
+    select(onet_soc_map, avg_wtd_impact, avg_imp_wtd_impact, avg_lvl_wtd_impact,
+           avg_ability_base, avg_importance_base, avg_level_base) %>%
+    distinct() %>%
+    mutate(ability_base_impact = avg_wtd_impact / avg_ability_base)
+
+
+  occ_data <- occ_data %>%
+    rename(occ_code = onet_soc_map)
+
+  occ_titles <- read_dta("../Data/Source data/AIOE and AIIE source files/occ_title_2020.dta")
+  occ_data <- occ_data %>%
+    inner_join(occ_titles, by = "occ_code")
+
+  aioe_col <- paste0(sample, "_aioe")
+  raw_col  <- paste0("raw_", sample, "_aioe")
+
+  occ_data <- occ_data %>%
+    mutate(
+      !!raw_col  := ability_base_impact,
+      !!aioe_col := as.numeric(scale(ability_base_impact))
+    )
+
+  sample_results[[sample]] <- occ_data
+}
+
+# PART 2 — Combining the three samples
+
+
+combined <- sample_results[["binary_all"]]
+
+for (sample in c("only_languagemodeling", "only_generatingimages")) {
+  cols_to_add <- sample_results[[sample]] %>%
+    select(occ_code,
+           ends_with("_aioe"),
+           starts_with("raw_"))
+  cols_to_add <- cols_to_add %>%
+    select(occ_code, contains(sample))
+  combined <- combined %>%
+    left_join(cols_to_add, by = "occ_code")
+}
+
+combined <- combined %>%
+  select(-avg_wtd_impact, -avg_imp_wtd_impact, -avg_lvl_wtd_impact,
+         -avg_importance_base, -avg_level_base)
+
+combined <- combined %>%
+  rename(
+    aggregate_aioe = binary_all_aioe,
+    lm_aioe        = only_languagemodeling_aioe,
+    ig_aioe        = only_generatingimages_aioe,
+    raw_lm_aioe    = raw_only_languagemodeling_aioe,
+    raw_ig_aioe    = raw_only_generatingimages_aioe
+  )
+
+# Save
+write_dta(combined, "../Data/Intermediate data/generative_ai_aioe.dta")
+
+# PART 3 (PANEL VERSION) — Build year-varying GenAI AIIE
+#
+# Changes from the cross-section version:
+#   - Uses oes
+#   - Employment shares are computed WITHIN (naics, year) cells, so the
+#     occupational mix used to weight AIOE -> AIIE varies across years
+#   - Aggregation is done by (naics, naics_title, year)
+#   - Standardisation is POOLED across the full panel (single mean / SD)
+#     so within-industry time variation survives. Do NOT z-score within year
+#     unless you want to wipe out the very variation FE regressions exploit.
+
+
+library(haven)
+library(tidyverse)
+library(readr)
+
+gen_ai_aioe <- read_dta("../Data/Intermediate data/generative_ai_aioe.dta") %>%
+  select(occ_code, aggregate_aioe, lm_aioe, ig_aioe)
+
+
+oes_panel <- read_csv(
+  "../Data/Intermediate data/oes_panel_2016_2024.csv",
+  col_types = cols(
+    year        = col_integer(),
+    naics       = col_character(),
+    naics_title = col_character(),
+    occ_code    = col_character(),
+    occ_title   = col_character(),
+    tot_emp     = col_double(),
+    o_group     = col_character(),
+    i_group     = col_character()
+  )
+) %>%
+  filter(o_group == "detailed") %>%
+  select(year, naics, naics_title, occ_code, tot_emp)
+
+
+oes_merged <- oes_panel %>%
+  inner_join(gen_ai_aioe, by = "occ_code") %>%
+  group_by(year, naics) %>%
+  mutate(
+    naics_emp       = sum(tot_emp, na.rm = TRUE),
+    naics_emp_share = tot_emp / naics_emp
+  ) %>%
+  ungroup() %>%
+  filter(is.finite(naics_emp_share))
+
+# Employment-weighted aggregation AIOE -> AIIE per (naics, year) 
+aiie_panel <- oes_merged %>%
+  mutate(
+    aggregate_contrib = aggregate_aioe * naics_emp_share,
+    lm_contrib        = lm_aioe        * naics_emp_share,
+    ig_contrib        = ig_aioe        * naics_emp_share
+  ) %>%
+  group_by(year, naics, naics_title) %>%
+  summarise(
+    aggregate_raw_aiie = sum(aggregate_contrib, na.rm = TRUE),
+    lm_raw_aiie        = sum(lm_contrib,        na.rm = TRUE),
+    ig_raw_aiie        = sum(ig_contrib,        na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 5. Pooled z-score standardisation across the full panel
+aiie_panel <- aiie_panel %>%
+  mutate(
+    aggregate_aiie = as.numeric(scale(aggregate_raw_aiie)),
+    lm_aiie        = as.numeric(scale(lm_raw_aiie)),
+    ig_aiie        = as.numeric(scale(ig_raw_aiie))
+  )
+
+ 
+# Pad panel with zero rows for pre-2016 years
+naics_lookup <- aiie_panel %>%
+  distinct(naics, naics_title) %>%
+  group_by(naics) %>%
+  slice(1) %>%   
+  ungroup()
+ 
+pad_years <- 1997:2015
+zero_rows <- naics_lookup %>%
+  crossing(year = pad_years) %>%
+  mutate(
+    aggregate_raw_aiie = 0,
+    lm_raw_aiie        = 0,
+    ig_raw_aiie        = 0,
+    aggregate_aiie     = 0,
+    lm_aiie            = 0,
+    ig_aiie            = 0
+  )
+ 
+aiie_panel <- bind_rows(aiie_panel, zero_rows) %>%
+  arrange(naics, year)
+
+# Save full NAICS-level panel 
+write_dta(aiie_panel, "../Data/Intermediate data/generative_ai_aiie_panel.dta")
+write_csv(aiie_panel, "../Data/Intermediate data/generative_ai_aiie_panel.csv")
+
+# Build a 4-digit merge-ready panel version 
+
+aiie_merge_panel <- aiie_panel %>%
+  mutate(naics4 = as.numeric(substr(naics, 1, 4))) %>%
+  group_by(year, naics4) %>%
+  mutate(check = n()) %>%
+  ungroup() %>%
+  filter(check <= 1) %>%
+  select(-check)
+
+write_dta(aiie_merge_panel, "../Data/Intermediate data/generative_ai_aiie_panel_merge.dta")
+write_csv(aiie_merge_panel, "../Data/Intermediate data/generative_ai_aiie_panel_merge.csv")
+
+# 8. Diagnostics 
+cat("\n=== Panel coverage (rows per year) ===\n")
+print(aiie_panel %>% count(year))
+
+cat("\n=== AIIE summary (pooled z-scores) ===\n")
+print(summary(aiie_panel %>% select(aggregate_aiie, lm_aiie, ig_aiie)))
+
+cat("\n=== Within-industry SD of AIIE (across years) ===\n")
+
+within_sd <- aiie_panel %>%
+  group_by(naics, naics_title) %>%
+  summarise(
+    sd_aggregate = sd(aggregate_aiie),
+    sd_lm        = sd(lm_aiie),
+    sd_ig        = sd(ig_aiie),
+    n_years      = n(),
+    .groups = "drop"
+  ) %>%
+  filter(n_years > 1)
+cat("Mean within-industry SD across measures:\n")
+print(within_sd %>% summarise(across(starts_with("sd_"), mean, na.rm = TRUE)))
+cat("\n(If these are very small, the AIIE barely moves within an industry —\n",
+    " expected here because AIOE is still pinned to abilities_2020. Adding\n",
+    " year-varying abilities will widen this.)\n", sep = "")
+
+cat("\n=== Top 10 (industry, year) cells by Language Modeling AIIE ===\n")
+aiie_panel %>%
+  arrange(desc(lm_aiie)) %>%
+  select(year, naics, naics_title, lm_aiie) %>%
+  head(10) %>% print()
+
+cat("\n=== Correlation between AIIE variants (panel-pooled) ===\n")
+print(cor(aiie_panel %>% select(aggregate_aiie, lm_aiie, ig_aiie),
+          use = "complete.obs"))
+
+
+
+# Summary statistics 
+cat("\n=== Summary: raw_lm_aioe ===\n")
+summary(combined$raw_lm_aioe)
+cat("SD:", sd(combined$raw_lm_aioe, na.rm = TRUE), "\n")
+
+cat("\n=== Summary: raw_ig_aioe ===\n")
+summary(combined$raw_ig_aioe)
+cat("SD:", sd(combined$raw_ig_aioe, na.rm = TRUE), "\n")
+
+cat("\n=== Paired t-test: raw_lm_aioe vs raw_ig_aioe ===\n")
+print(t.test(combined$raw_lm_aioe, combined$raw_ig_aioe, paired = TRUE))
+
+# FIGURE 1 — Binscatter: AIOE vs Salary, Education, Creative Weight
+
+
+gen_ai <- read_dta("../Data/Intermediate data/generative_ai_aioe.dta")
+
+salary <- read_dta("../Data/Source data/AIOE and AIIE source files/occ_salary_data_2021.dta")
+gen_ai <- gen_ai %>% left_join(salary, by = "occ_code") %>% filter(!is.na(lm_aioe))
+
+education <- read_dta("../Data/Source data/AIOE and AIIE source files/occ_required_education.dta")
+gen_ai <- gen_ai %>% left_join(education, by = "occ_code")
+
+creative <- read_dta("../Data/Source data/AIOE and AIIE source files/occ_creative_weight.dta")
+gen_ai <- gen_ai %>% left_join(creative, by = "occ_code")
+
+fig1_data <- gen_ai %>%
+  select(occ_code, occ_req_education, median_salary_2021,
+         avg_creative_weight, lm_aioe, ig_aioe)
+
+
+fig1_long <- fig1_data %>%
+  pivot_longer(cols = c(lm_aioe, ig_aioe),
+               names_to = "application",
+               values_to = "aioe") %>%
+  mutate(application = dplyr::recode(application,
+                                   "lm_aioe" = "Language Modeling",
+                                   "ig_aioe" = "Image Generation"))
+
+# Binscatter: AIOE vs Median Salary
+bs1 <- binscatter_data(fig1_long, "median_salary_2021", "aioe", "application")
+ggplot(bs1, aes(x = x, y = y, color = group, shape = group)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = 0, color = "black") +
+  scale_color_manual(values = c("Language Modeling" = "navy",
+                                "Image Generation" = "steelblue")) +
+  scale_shape_manual(values = c("Language Modeling" = 16,
+                                "Image Generation" = 18)) +
+  labs(x = "Median Salary 2021\n(Thousands of Dollars)",
+       y = "Exposure to Generative AI",
+       color = NULL, shape = NULL) +
+  theme_minimal()
+
+# Binscatter: AIOE vs Required Education
+bs2 <- binscatter_data(fig1_long, "occ_req_education", "aioe", "application")
+ggplot(bs2, aes(x = x, y = y, color = group, shape = group)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = 0, color = "black") +
+  scale_color_manual(values = c("Language Modeling" = "navy",
+                                "Image Generation" = "steelblue")) +
+  scale_shape_manual(values = c("Language Modeling" = 16,
+                                "Image Generation" = 18)) +
+  scale_x_continuous(breaks = seq(0, 12, 2)) +
+  labs(x = "Occupation Required Education Level",
+       y = "Exposure to Generative AI",
+       color = NULL, shape = NULL) +
+  theme_minimal()
+
+# Binscatter: AIOE vs Creative Weight
+bs3 <- binscatter_data(fig1_long, "avg_creative_weight", "aioe", "application")
+ggplot(bs3, aes(x = x, y = y, color = group, shape = group)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = 0, color = "black") +
+  scale_color_manual(values = c("Language Modeling" = "navy",
+                                "Image Generation" = "steelblue")) +
+  scale_shape_manual(values = c("Language Modeling" = 16,
+                                "Image Generation" = 18)) +
+  scale_x_continuous(labels = scales::percent_format(),
+                     breaks = seq(0, 0.10, 0.02)) +
+  labs(x = "Relative Weight of Creative Abilities",
+       y = "Exposure to Generative AI",
+       color = NULL, shape = NULL) +
+  theme_minimal()
+
+
+# FIGURE 2 — Binscatter: AIOE vs Demographic Representation
+
+gen_ai2 <- read_dta("../Data/Intermediate data/generative_ai_aioe.dta")
+
+representation <- read_dta("../Data/Source data/AIOE and AIIE source files/occ_representation.dta")
+gen_ai2 <- gen_ai2 %>%
+  inner_join(representation, by = "occ_code")
+
+fig2_data <- gen_ai2 %>%
+  select(occ_code, lm_aioe, ig_aioe,
+         mean_female, mean_nonwhite, mean_black,
+         mean_asian, mean_hispanic, mean_male, mean_white)
+
+fig2_long <- fig2_data %>%
+  pivot_longer(cols = c(lm_aioe, ig_aioe),
+               names_to = "application",
+               values_to = "aioe") %>%
+  mutate(application = dplyr::recode(application,
+                                   "lm_aioe" = "Language Modeling",
+                                   "ig_aioe" = "Image Generation"))
+
+plot_demographic <- function(data, xvar, xlabel, nbins = 20) {
+  bs <- binscatter_data(data, xvar, "aioe", "application", nbins)
+  ggplot(bs, aes(x = x, y = y, color = group, shape = group)) +
+    geom_point(size = 3) +
+    geom_hline(yintercept = 0, color = "black") +
+    scale_color_manual(values = c("Language Modeling AIOE" = "navy",
+                                  "Image Generation AIOE" = "steelblue")) +
+    scale_shape_manual(values = c("Language Modeling AIOE" = 16,
+                                  "Image Generation AIOE" = 18)) +
+    labs(x = xlabel, y = "Exposure to Generative AI",
+         color = NULL, shape = NULL) +
+    theme_minimal()
+}
+
+plot_demographic(fig2_long, "mean_male",     "Percent Male Employment")
+plot_demographic(fig2_long, "mean_female",   "Percent Female Employment")
+plot_demographic(fig2_long, "mean_white",    "Percent White Employment")
+plot_demographic(fig2_long, "mean_black",    "Percent Black Employment")
+plot_demographic(fig2_long, "mean_asian",    "Percent Asian Employment")
+plot_demographic(fig2_long, "mean_hispanic", "Percent Hispanic Employment")
+
+
+# SUPPLEMENTARY — Scatter: Cross-measure Comparisons
+
+gen_ai3 <- read_dta("../Data/Intermediate data/generative_ai_aioe.dta")
+
+# LM vs Aggregate
+ggplot(gen_ai3, aes(x = aggregate_aioe, y = lm_aioe)) +
+  geom_point() +
+  scale_y_continuous(breaks = seq(-3, 3, 1), limits = c(-3, 3)) +
+  scale_x_continuous(breaks = seq(-3, 2, 1), limits = c(-3, 2)) +
+  labs(y = "Language Modeling AIOE", x = "All Applications AIOE") +
+  theme_minimal()
+
+# IG vs Aggregate
+ggplot(gen_ai3, aes(x = aggregate_aioe, y = ig_aioe)) +
+  geom_point() +
+  scale_y_continuous(breaks = seq(-3, 3, 1), limits = c(-3, 3)) +
+  scale_x_continuous(breaks = seq(-3, 2, 1), limits = c(-3, 2)) +
+  labs(y = "Image Generation AIOE", x = "All Applications AIOE") +
+  theme_minimal()
+
+# IG vs LM
+ggplot(gen_ai3, aes(x = lm_aioe, y = ig_aioe)) +
+  geom_point() +
+  scale_y_continuous(breaks = seq(-3, 3, 1), limits = c(-3, 3)) +
+  scale_x_continuous(breaks = seq(-3, 3, 1), limits = c(-3, 3)) +
+  labs(y = "Image Generation AIOE", x = "Language Modeling AIOE") +
+  theme_minimal()
+
+
+# SUPPLEMENTARY — Regression Analysis 
+gen_ai4 <- read_dta("../Data/Intermediate data/generative_ai_aioe.dta")
+
+salary <- read_dta("../Data/Source data/AIOE and AIIE source files/occ_salary_data_2021.dta")
+gen_ai4 <- gen_ai4 %>% inner_join(salary, by = "occ_code")
+
+education <- read_dta("../Data/Source data/AIOE and AIIE source files/occ_required_education.dta")
+gen_ai4 <- gen_ai4 %>% left_join(education, by = "occ_code")
+
+creative <- read_dta("../Data/Source data/AIOE and AIIE source files/occ_creative_weight.dta")
+gen_ai4 <- gen_ai4 %>% left_join(creative, by = "occ_code")
+
+gen_ai4 <- gen_ai4 %>%
+  mutate(broad_category = as.factor(str_sub(occ_code, 1, 2)))
+
+# Supplemental Table 1: LM regressions 
+dep_vars_1 <- c("median_salary_2021", "occ_req_education", "avg_creative_weight")
+
+sup_table1 <- list()
+
+for (dv in dep_vars_1) {
+  fml <- as.formula(paste0(dv, " ~ lm_aioe + avg_ability_base + broad_category"))
+  mod <- lm(fml, data = gen_ai4)
+  ct  <- coeftest(mod, vcov = vcovCL(mod, cluster = gen_ai4$occ_code))
+  sup_table1[[paste0(dv, "_lm")]] <- ct
+}
+
+for (dv in dep_vars_1) {
+  fml <- as.formula(paste0(dv, " ~ ig_aioe + avg_ability_base + broad_category"))
+  mod <- lm(fml, data = gen_ai4)
+  ct  <- coeftest(mod, vcov = vcovCL(mod, cluster = gen_ai4$occ_code))
+  sup_table1[[paste0(dv, "_ig")]] <- ct
+}
+
+# Print Supplemental Table 1
+cat("\n========== SUPPLEMENTAL TABLE 1 ==========\n")
+for (nm in names(sup_table1)) {
+  cat("\n---", nm, "---\n")
+  print(sup_table1[[nm]])
+}
+
+# Supplemental Table 2: Demographic regressions 
+gen_ai5 <- read_dta("../Data/Intermediate data/generative_ai_aioe.dta")
+
+rep_data <- read_dta("../Data/Source data/AIOE and AIIE source files/occ_representation.dta")
+gen_ai5 <- gen_ai5 %>% inner_join(rep_data, by = "occ_code")
+
+gen_ai5 <- gen_ai5 %>%
+  mutate(broad_category = as.factor(str_sub(occ_code, 1, 2)))
+
+dep_vars_2 <- c("mean_male", "mean_female", "mean_white",
+                 "mean_black", "mean_asian", "mean_hispanic")
+
+sup_table2 <- list()
+
+for (dv in dep_vars_2) {
+  fml <- as.formula(paste0(dv, " ~ lm_aioe + avg_ability_base + broad_category"))
+  mod <- lm(fml, data = gen_ai5)
+  ct  <- coeftest(mod, vcov = vcovCL(mod, cluster = gen_ai5$occ_code))
+  sup_table2[[paste0(dv, "_lm")]] <- ct
+}
+
+for (dv in dep_vars_2) {
+  fml <- as.formula(paste0(dv, " ~ ig_aioe + avg_ability_base + broad_category"))
+  mod <- lm(fml, data = gen_ai5)
+  ct  <- coeftest(mod, vcov = vcovCL(mod, cluster = gen_ai5$occ_code))
+  sup_table2[[paste0(dv, "_ig")]] <- ct
+}
+
+# Print Supplemental Table 2
+cat("\n========== SUPPLEMENTAL TABLE 2 ==========\n")
+for (nm in names(sup_table2)) {
+  cat("\n---", nm, "---\n")
+  print(sup_table2[[nm]])
+}
+
+```

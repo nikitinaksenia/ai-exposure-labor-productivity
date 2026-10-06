@@ -1,0 +1,727 @@
+---
+title: "Final Panel Merge"
+output: pdf_document
+date: "2026-05-08"
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(readxl)
+library(fixest)
+library(janitor)
+
+winsorize <- function(x, p = 0.01) {
+  lo <- quantile(x, p, na.rm = TRUE)
+  hi <- quantile(x, 1 - p, na.rm = TRUE)
+  pmax(pmin(x, hi), lo)
+}
+```
+
+---
+
+## Labor Productivity
+
+```{r}
+bls_raw <- read_excel(
+  "../Data/Source data/major-industry-total-factor-productivity-klems.xlsx",
+  sheet = "MachineReadable"
+) %>%
+  clean_names()
+
+labor_productivity <- bls_raw %>%
+  filter(
+    basis   == "All workers",
+    measure == "Labor productivity",
+    units   == "Index (2017=100)",
+    year    >= 1997,
+    year    <= 2024
+  ) %>%
+  select(bls_naics = naics, bls_industry = industry, year, lp_index = value) %>%
+  mutate(
+    year     = as.integer(year),
+    lp_index = as.numeric(lp_index),
+    ln_lp    = log(lp_index)
+  ) %>%
+  filter(!is.na(lp_index))
+
+tfp_productivity <- bls_raw %>%
+  filter(
+    basis   == "All workers",
+    measure == "Total factor productivity",
+    units   == "Index (2017=100)",
+    year    >= 1997,
+    year    <= 2024
+  ) %>%
+  select(bls_naics = naics, bls_industry = industry, year, tfp_index = value) %>%
+  mutate(
+    year      = as.integer(year),
+    tfp_index = as.numeric(tfp_index),
+    ln_tfp    = log(tfp_index)
+  ) %>%
+  filter(!is.na(tfp_index))
+
+capital_contrib <- bls_raw %>%
+  filter(
+    measure == "Contribution of capital intensity to labor productivity",
+    units   == "Index (2017=100)",
+    year    >= 1997,
+    year    <= 2024
+  ) %>%
+  select(bls_naics = naics, bls_industry = industry, year,
+         capital_contrib_lp = value) %>%
+  mutate(
+    year               = as.integer(year),
+    capital_contrib_lp = as.numeric(capital_contrib_lp)
+  )
+
+ipp_contrib <- bls_raw %>%
+  filter(
+    measure == "Contribution of capital input excluding IPP and IPE intensity to labor productivity",
+    units   == "Index (2017=100)",
+    year    >= 1997,
+    year    <= 2024
+  ) %>%
+  select(bls_naics = naics, bls_industry = industry, year,
+         non_ict_capital_contrib = value) %>%
+  mutate(
+    year                    = as.integer(year),
+    non_ict_capital_contrib = as.numeric(non_ict_capital_contrib)
+  )
+
+eng_contrib <- bls_raw %>%
+  filter(
+    measure == "Contribution of energy intensity to labor productivity",
+    units   == "Index (2017=100)",
+    year    >= 1997,
+    year    <= 2024
+  ) %>%
+  select(bls_naics = naics, bls_industry = industry, year,
+         eng_contrib = value) %>%
+  mutate(
+    year                    = as.integer(year),
+    eng_contrib = as.numeric(eng_contrib)
+  )
+
+cat("Labor productivity rows:", nrow(labor_productivity), "\n")
+cat("Industries:", n_distinct(labor_productivity$bls_naics), "\n")
+cat("Years:", min(labor_productivity$year), "to", max(labor_productivity$year), "\n")
+```
+
+
+## Controls
+
+```{r}
+
+controls_raw <- read_excel(
+  "../Data/Source data/Controls_Panel_1997_2022.xlsx",
+  sheet = "Panel"
+) %>%
+  clean_names()
+
+controls <- controls_raw %>%
+  filter(year >= 1997, year <= 2022) %>%
+  mutate(
+    year              = as.integer(year),
+    capital_intensity = as.numeric(capital_intensity),
+    log_va_growth     = as.numeric(log_va_growth),
+    college_share     = as.numeric(education_college_share)
+  ) %>%
+  select(
+    ctrl_industry = industry,
+    bea_code,
+    ctrl_naics    = naics_code,
+    year,
+    capital_intensity,
+    log_va_growth,
+    college_share
+  )
+
+# ── Extend to 2024 with NA placeholders for 2023 and 2024 ────────────────────
+controls_extended <- controls %>%
+  distinct(ctrl_industry, bea_code, ctrl_naics) %>%
+  crossing(year = c(2023L, 2024L)) %>%
+  mutate(
+    capital_intensity = NA_real_,
+    log_va_growth     = NA_real_,
+    college_share     = NA_real_
+  )
+
+controls <- bind_rows(controls, controls_extended) %>%
+  arrange(bea_code, year)
+
+cat("Controls rows after extension:", nrow(controls), "\n")
+cat("Years now covered:", min(controls$year), "to", max(controls$year), "\n")
+```
+
+
+## BLS NAICS → BEA Crosswalk
+
+```{r}
+
+crosswalk <- tribble(
+  ~bls_naics,             ~bea_code,
+  # Agriculture
+  "111-112",              "111CA",
+  "113-115",              "113FF",
+  # Mining
+  "211",                  "211",
+  "212",                  "212",
+  "213",                  "213",
+  # Utilities, Construction
+  "22",                   "22",
+  "23",                   "23",
+  # Manufacturing — Nondurables
+  "311-312",              "311FT",
+  "313-314",              "313TT",
+  "315-316",              "315AL",
+  "321",                  "321",
+  "322",                  "322",
+  "323",                  "323",
+  "324",                  "324",
+  "325",                  "325",
+  "326",                  "326",
+  "327",                  "327",
+  # Manufacturing — Durables
+  "331",                  "331",
+  "332",                  "332",
+  "333",                  "333",
+  "334",                  "334",
+  "335",                  "335",
+  "3361-3363",            "3361MV",
+  "3364-3369",            "3364OT",
+  "337",                  "337",
+  "339",                  "339",
+  # Trade
+  "42",                   "42",
+  "44,45",                "44RT",
+  # Transportation
+  "481",                  "481",
+  "482",                  "482",
+  "483",                  "483",
+  "484",                  "484",
+  "485",                  "485",
+  "486",                  "486",
+  "487,488,492",          "487OS",
+  "493",                  "493",
+  # Information
+  "511",                  "511",
+  "512",                  "512",
+  "515,517",              "513",
+  "518-519",              "514",
+  # Finance
+  "521-522",              "52CI",   
+  "523",                  "523",
+  "524",                  "524",
+  "525",                  "525",
+  # Real estate
+  "531",                  "531",
+  "532-533",              "532RL",
+  # Professional services
+  "5411",                 "5411",
+  "5415",                 "5415",
+  "5412-5414,5416-5419",  "5412OP",
+  "55",                   "55",
+  "561",                  "561",
+  "562",                  "562",
+  # Education, health
+  "61",                   "61",
+  "621",                  "621",
+  "622-623",              "622HO",
+  "624",                  "624",
+  # Arts, accommodation, food
+  "711-712",              "711AS",
+  "713",                  "713",
+  "721",                  "721",
+  "722",                  "722",
+  # Other services
+  "81",                   "81"
+)
+
+cat("Crosswalk entries:", nrow(crosswalk), "\n")
+
+
+labor_productivity %>%
+  distinct(bls_naics) %>%
+  left_join(crosswalk, by = "bls_naics") %>%
+  summarize(
+    total_bls = n(),
+    matched   = sum(!is.na(bea_code)),
+    unmatched = sum(is.na(bea_code))
+  ) %>%
+  print()
+```
+
+## Merge Labor Productivity + Controls
+
+```{r}
+panel_merged <- labor_productivity %>%
+  inner_join(crosswalk, by = "bls_naics") %>%
+  inner_join(tfp_productivity, by = c("bls_naics", "year")) %>%
+  inner_join(controls, by = c("bea_code", "year")) %>%
+  select(
+    bea_code,
+    industry = ctrl_industry,
+    bls_naics,
+    year,
+    lp_index,
+    tfp_index,
+    ln_tfp,
+    ln_lp,
+    capital_intensity,
+    log_va_growth,
+    college_share
+  )
+
+cat("Rows:", nrow(panel_merged), "\n")
+cat("Industries:", n_distinct(panel_merged$bea_code), "\n")
+cat("Years:", min(panel_merged$year), "to", max(panel_merged$year), "\n")
+```
+
+
+## Intelligence Index
+
+```{r}
+intelligence_index <- tibble(
+  year = 1997:2024,
+  intelligence_index = c(
+    0.000, 0.000, 0.000, 0.000, 0.000, 0.000,
+    0.000, 0.000, 0.000, 0.000, 0.000, 0.000,
+    0.000, 0.000, 0.000, 0.000, 0.000, 0.000,
+    0.000, 0.010, 0.020, 0.040, 0.060, 0.080,
+    0.100, 0.100, 0.240,0.4
+  )
+)
+
+panel_merged <- panel_merged %>%
+  left_join(intelligence_index, by = "year")
+
+head(panel_merged)
+
+write_csv(panel_merged, "../Data/Intermediate data/panel_lpctrl2.csv")
+cat("Saved to panel_lpctrl2.csv\n")
+```
+
+## Add Capital Contribution Controls
+
+```{r}
+panel_merged1 <- panel_merged %>%
+  left_join(eng_contrib, by = c("bls_naics", "year")) %>%
+  left_join(capital_contrib, by = c("bls_naics", "year")) %>%
+  left_join(ipp_contrib,     by = c("bls_naics", "year")) %>%
+  mutate(
+    ict_capital_contrib = capital_contrib_lp - non_ict_capital_contrib
+  )
+head(panel_merged1)
+
+write_csv(panel_merged1, "../Data/Intermediate data/panel_lpctrls2.csv")
+cat("Saved to panel_lpctrls2.csv\n")
+```
+
+
+## Add AIIE (Employment-Weighted, with 521-522 Fix)
+
+```{r}
+library(tidyverse)
+library(janitor)
+
+panel2<- read_csv("../Data/Intermediate data/panel_lpctrls2.csv") %>%
+  clean_names()
+head(panel2)
+aiie_raw  <- read_csv("../Data/Intermediate data/genAIIE with empl panel for K.csv") %>%
+  clean_names() %>%
+  mutate(naics = as.character(naics))
+
+# ── Step 1: Map 6-digit NAICS to BEA codes ─────────────────────────────────
+aiie <- aiie_raw %>%
+  mutate(bea_code = case_when(
+    naics %in% c("113300", "115100", "115200")           ~ "113FF",
+    naics == "211100"                                    ~ "211",
+    naics %in% c("212100", "212200", "212300")           ~ "212",
+    naics == "213100"                                    ~ "213",
+    str_starts(naics, "221")                             ~ "22",
+    str_starts(naics, "236") | str_starts(naics, "237") |
+      str_starts(naics, "238")                           ~ "23",
+    str_starts(naics, "311") | str_starts(naics, "312") ~ "311FT",
+    str_starts(naics, "313") | str_starts(naics, "314") ~ "313TT",
+    str_starts(naics, "315") | str_starts(naics, "316") ~ "315AL",
+    str_starts(naics, "321")                             ~ "321",
+    str_starts(naics, "322")                             ~ "322",
+    str_starts(naics, "323")                             ~ "323",
+    str_starts(naics, "324")                             ~ "324",
+    str_starts(naics, "325")                             ~ "325",
+    str_starts(naics, "326")                             ~ "326",
+    str_starts(naics, "327")                             ~ "327",
+    str_starts(naics, "331")                             ~ "331",
+    str_starts(naics, "332")                             ~ "332",
+    str_starts(naics, "333")                             ~ "333",
+    str_starts(naics, "334")                             ~ "334",
+    str_starts(naics, "335")                             ~ "335",
+    naics %in% c("336100", "336200", "336300")           ~ "3361MV",
+    naics %in% c("336400", "336500", "336600", "336900") ~ "3364OT",
+    str_starts(naics, "337")                             ~ "337",
+    str_starts(naics, "339")                             ~ "339",
+    str_starts(naics, "423") | str_starts(naics, "424") |
+      str_starts(naics, "425") |
+      naics %in% c("4230A1", "4240A1", "4240A2", "4240A3") ~ "42",
+    str_starts(naics, "441") | str_starts(naics, "442") |
+      str_starts(naics, "443") | str_starts(naics, "444") |
+      str_starts(naics, "445") | naics == "4450A1"      |
+      str_starts(naics, "446") | str_starts(naics, "447") |
+      str_starts(naics, "448") | str_starts(naics, "451") |
+      str_starts(naics, "452") | str_starts(naics, "453") |
+      naics == "4530A1"         | str_starts(naics, "454") ~ "44RT",
+    str_starts(naics, "481")                             ~ "481",
+    str_starts(naics, "482")                             ~ "482",
+    str_starts(naics, "483")                             ~ "483",
+    str_starts(naics, "484")                             ~ "484",
+    str_starts(naics, "485")                             ~ "485",
+    str_starts(naics, "486")                             ~ "486",
+    str_starts(naics, "487") | str_starts(naics, "488") |
+      str_starts(naics, "492")                           ~ "487OS",
+    str_starts(naics, "493")                             ~ "493",
+    str_starts(naics, "511")                             ~ "511",
+    str_starts(naics, "512")                             ~ "512",
+    str_starts(naics, "515") | naics == "517000"         ~ "513",
+    str_starts(naics, "518") | str_starts(naics, "519") ~ "514",
+    # FIX 1: 521-522 added — was missing, caused 52CI to drop from AIIE merge
+    str_starts(naics, "521") | str_starts(naics, "522") ~ "52CI",
+    str_starts(naics, "523")                             ~ "523",
+    str_starts(naics, "524")                             ~ "524",
+    str_starts(naics, "525")                             ~ "525",
+    str_starts(naics, "531")                             ~ "531",
+    str_starts(naics, "532") | str_starts(naics, "533") |
+      naics == "5320A1"                                  ~ "532RL",
+    naics == "541100"                                    ~ "5411",
+    naics == "541500"                                    ~ "5415",
+    naics %in% c("541200", "541300", "541400",
+                 "541600", "541700", "541800", "541900") ~ "5412OP",
+    str_starts(naics, "551")                             ~ "55",
+    str_starts(naics, "561")                             ~ "561",
+    str_starts(naics, "562")                             ~ "562",
+    str_starts(naics, "611")                             ~ "61",
+    str_starts(naics, "621")                             ~ "621",
+    str_starts(naics, "622") | str_starts(naics, "623") ~ "622HO",
+    str_starts(naics, "624")                             ~ "624",
+    str_starts(naics, "711") | str_starts(naics, "712") ~ "711AS",
+    str_starts(naics, "713")                             ~ "713",
+    str_starts(naics, "721")                             ~ "721",
+    str_starts(naics, "722")                             ~ "722",
+    str_starts(naics, "811") | str_starts(naics, "812") |
+      str_starts(naics, "813")                           ~ "81",
+    TRUE ~ NA_character_
+  ))
+
+
+cat("=== AIIE NAICS WITH NO BEA MATCH ===\n")
+aiie %>%
+  filter(is.na(bea_code)) %>%
+  distinct(naics, naics_title) %>%
+  arrange(naics) %>%
+  print(n = 50)
+
+cat("\n=== PANEL INDUSTRIES WITH NO AIIE MATCH ===\n")
+panel2 %>%
+  distinct(bea_code, industry) %>%
+  anti_join(aiie %>% filter(!is.na(bea_code)) %>% distinct(bea_code),
+            by = "bea_code") %>%
+  print()
+
+# ── Step 2: Aggregate AIIE to bea_code x year using employment weights ──────
+
+aiie_weighted <- aiie %>%
+  filter(!is.na(bea_code)) %>%
+  group_by(bea_code, year) %>%
+  summarise(
+    # Employment-weighted average within each BEA group x year
+    aggregate_raw_aiie_w = weighted.mean(aggregate_raw_aiie, w = employment,
+                                       na.rm = TRUE),
+    lm_raw_aiie_w        = weighted.mean(lm_raw_aiie,        w = employment,
+                                       na.rm = TRUE),
+    ig_raw_aiie_w        = weighted.mean(ig_raw_aiie,         w = employment,
+                                       na.rm = TRUE),
+    aggregate_aiie_w     = weighted.mean(aggregate_aiie,      w = employment,
+                                       na.rm = TRUE),
+    lm_aiie_w            = weighted.mean(lm_aiie,             w = employment,
+                                       na.rm = TRUE),
+    ig_aiie_w            = weighted.mean(ig_aiie,             w = employment,
+                                       na.rm = TRUE),
+    employment     = sum(employment,     na.rm = TRUE),
+    log_employment = log(sum(employment, na.rm = TRUE)),
+
+    .groups = "drop"
+  ) %>%
+  mutate(
+    employment     = na_if(employment,     0),
+    log_employment = na_if(log_employment, -Inf)
+  ) %>%
+  arrange(bea_code, year) %>%
+  group_by(bea_code) %>%
+  mutate(
+    employment_lag1     = lag(employment,     1),
+    log_employment_lag1 = lag(log_employment, 1)
+  ) %>%
+  ungroup()
+    
+
+
+panel_merged2 <- aiie_weighted %>%
+  right_join(panel2, by = c("bea_code", "year")) %>%
+  select(all_of(names(panel2)),
+         aggregate_raw_aiie_w, lm_raw_aiie_w, ig_raw_aiie_w,
+         aggregate_aiie_w, lm_aiie_w, ig_aiie_w, employment, log_employment, employment_lag1, log_employment_lag1)
+
+head(panel_merged2)
+
+aiie2 <- aiie %>%
+  filter(!is.na(bea_code)) %>%
+  group_by(bea_code, year) %>%
+  summarise(
+    # Employment-weighted average within each BEA group x year
+    aggregate_raw_aiie = mean(aggregate_raw_aiie, na.rm = TRUE),
+    lm_raw_aiie        = mean(lm_raw_aiie,        na.rm = TRUE),
+    ig_raw_aiie        = mean(ig_raw_aiie,         na.rm = TRUE),
+    aggregate_aiie     = mean(aggregate_aiie,      na.rm = TRUE),
+    lm_aiie            = mean(lm_aiie,             na.rm = TRUE),
+    ig_aiie            = mean(ig_aiie,             na.rm = TRUE),
+    .groups = "drop"
+  )
+
+panel_merged3 <- aiie2 %>%
+  right_join(panel_merged2, by = c("bea_code", "year")) %>%
+  select(all_of(names(panel_merged2)),
+         aggregate_raw_aiie, lm_raw_aiie, ig_raw_aiie,
+         aggregate_aiie, lm_aiie, ig_aiie)
+
+cat("\n=== MERGED PANEL (with AIIE) ===\n")
+cat("Rows:        ", nrow(panel_merged3), "\n")
+cat("Industries:  ", n_distinct(panel_merged3$bea_code), "\n")
+cat("Years:       ", min(panel_merged3$year), "–", max(panel_merged3$year), "\n")
+cat("Missing AIIE:", sum(is.na(panel_merged3$aggregate_aiie)), "\n")
+
+head(panel_merged3)
+
+write_csv(panel_merged3, "../Data/Intermediate data/panel_mergedtry1.csv")
+cat("Saved → panel_mergedtry1.csv\n")
+```
+
+## Build WFH Industry Score (Dingel & Neiman)
+
+```{r}
+# Inputs 
+
+wfh_occ <- read_csv(
+  "../Data/Source data/occupations_workathome.csv"
+) %>%
+  clean_names() %>%
+  mutate(occ_code = str_sub(onetsoccode, 1, 7))
+
+oes_2019 <- read_excel(
+  "../Data/Source data/Employment source files/nat4d_M2019_dl.xlsx"
+) %>%
+  clean_names() %>%
+  filter(area_type == 1, o_group == "detailed") %>%
+  mutate(
+    naics   = as.character(naics),
+    tot_emp = as.numeric(tot_emp)
+  ) %>%
+  filter(!is.na(tot_emp), tot_emp > 0)
+
+# ── Step 1: Build WFH lookup with three-tier fallback ───────────────────────
+wfh_detailed <- wfh_occ %>%
+  group_by(occ_code) %>%
+  summarise(wfh = mean(teleworkable, na.rm = TRUE), .groups = "drop")
+
+# Broad fallback: use first 6 characters (XX-XXXX -> XX-XXX*)
+wfh_broad <- wfh_occ %>%
+  mutate(occ_broad = str_sub(occ_code, 1, 6)) %>%
+  group_by(occ_broad) %>%
+  summarise(wfh_broad = mean(teleworkable, na.rm = TRUE), .groups = "drop")
+
+# Major group fallback: use first 2 characters (XX-)
+wfh_major <- wfh_occ %>%
+  mutate(major_group = str_sub(occ_code, 1, 2)) %>%
+  group_by(major_group) %>%
+  summarise(wfh_major = mean(teleworkable, na.rm = TRUE), .groups = "drop")
+
+# ── Step 2: Merge WFH onto OES, applying fallbacks for unmatched occupations
+oes_with_wfh <- oes_2019 %>%
+  # Tier 1: exact 6-char SOC match
+  left_join(wfh_detailed, by = "occ_code") %>%
+  # Tier 2: broad group fallback (first 6 chars)
+  mutate(occ_broad = str_sub(occ_code, 1, 6)) %>%
+  left_join(wfh_broad, by = "occ_broad") %>%
+  # Tier 3: major group fallback (first 2 chars)
+  mutate(major_group = str_sub(occ_code, 1, 2)) %>%
+  left_join(wfh_major, by = "major_group") %>%
+
+  mutate(
+    wfh_score = case_when(
+      !is.na(wfh)       ~ wfh,        # exact match
+      !is.na(wfh_broad) ~ wfh_broad,  # broad group
+      !is.na(wfh_major) ~ wfh_major,  # major group
+      TRUE              ~ NA_real_
+    ),
+    match_tier = case_when(
+      !is.na(wfh)       ~ "exact",
+      !is.na(wfh_broad) ~ "broad",
+      !is.na(wfh_major) ~ "major",
+      TRUE              ~ "unmatched"
+    )
+  )
+
+cat("=== WFH MATCH QUALITY ===\n")
+oes_with_wfh %>%
+  group_by(match_tier) %>%
+  summarise(
+    n_occ_rows = n(),
+    total_emp  = sum(tot_emp, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(emp_share = round(total_emp / sum(total_emp) * 100, 1)) %>%
+  print()
+
+# ── Step 3: Map OES NAICS to BEA codes ──────────────────────────────────────
+oes_with_wfh <- oes_with_wfh %>%
+  mutate(bea_code = case_when(
+    naics %in% c("113300", "115100", "115200")           ~ "113FF",
+    naics == "211100"                                    ~ "211",
+    naics %in% c("212100", "212200", "212300")           ~ "212",
+    naics == "213100"                                    ~ "213",
+    str_starts(naics, "221")                             ~ "22",
+    str_starts(naics, "236") | str_starts(naics, "237") |
+      str_starts(naics, "238")                           ~ "23",
+    str_starts(naics, "311") | str_starts(naics, "312") ~ "311FT",
+    str_starts(naics, "313") | str_starts(naics, "314") ~ "313TT",
+    str_starts(naics, "315") | str_starts(naics, "316") ~ "315AL",
+    str_starts(naics, "321")                             ~ "321",
+    str_starts(naics, "322")                             ~ "322",
+    str_starts(naics, "323")                             ~ "323",
+    str_starts(naics, "324")                             ~ "324",
+    str_starts(naics, "325")                             ~ "325",
+    str_starts(naics, "326")                             ~ "326",
+    str_starts(naics, "327")                             ~ "327",
+    str_starts(naics, "331")                             ~ "331",
+    str_starts(naics, "332")                             ~ "332",
+    str_starts(naics, "333")                             ~ "333",
+    str_starts(naics, "334")                             ~ "334",
+    str_starts(naics, "335")                             ~ "335",
+    naics %in% c("336100", "336200", "336300")           ~ "3361MV",
+    naics %in% c("336400", "336500", "336600", "336900") ~ "3364OT",
+    str_starts(naics, "337")                             ~ "337",
+    str_starts(naics, "339")                             ~ "339",
+    str_starts(naics, "423") | str_starts(naics, "424") |
+      str_starts(naics, "425") |
+      naics %in% c("4230A1", "4240A1", "4240A2", "4240A3") ~ "42",
+    str_starts(naics, "441") | str_starts(naics, "442") |
+      str_starts(naics, "443") | str_starts(naics, "444") |
+      str_starts(naics, "445") | naics == "4450A1"      |
+      str_starts(naics, "446") | str_starts(naics, "447") |
+      str_starts(naics, "448") | str_starts(naics, "451") |
+      str_starts(naics, "452") | str_starts(naics, "453") |
+      naics == "4530A1"         | str_starts(naics, "454") ~ "44RT",
+    str_starts(naics, "481")                             ~ "481",
+    str_starts(naics, "482")                             ~ "482",
+    str_starts(naics, "483")                             ~ "483",
+    str_starts(naics, "484")                             ~ "484",
+    str_starts(naics, "485")                             ~ "485",
+    str_starts(naics, "486")                             ~ "486",
+    str_starts(naics, "487") | str_starts(naics, "488") |
+      str_starts(naics, "492")                           ~ "487OS",
+    str_starts(naics, "493")                             ~ "493",
+    str_starts(naics, "511")                             ~ "511",
+    str_starts(naics, "512")                             ~ "512",
+    str_starts(naics, "515") | naics == "517000"         ~ "513",
+    str_starts(naics, "518") | str_starts(naics, "519") ~ "514",
+    str_starts(naics, "521") | str_starts(naics, "522") ~ "52CI",
+    str_starts(naics, "523")                             ~ "523",
+    str_starts(naics, "524")                             ~ "524",
+    str_starts(naics, "525")                             ~ "525",
+    str_starts(naics, "531")                             ~ "531",
+    str_starts(naics, "532") | str_starts(naics, "533") |
+      naics == "5320A1"                                  ~ "532RL",
+    naics == "541100"                                    ~ "5411",
+    naics == "541500"                                    ~ "5415",
+    naics %in% c("541200", "541300", "541400",
+                 "541600", "541700", "541800", "541900") ~ "5412OP",
+    str_starts(naics, "551")                             ~ "55",
+    str_starts(naics, "561")                             ~ "561",
+    str_starts(naics, "562")                             ~ "562",
+    str_starts(naics, "611")                             ~ "61",
+    str_starts(naics, "621")                             ~ "621",
+    str_starts(naics, "622") | str_starts(naics, "623") ~ "622HO",
+    str_starts(naics, "624")                             ~ "624",
+    str_starts(naics, "711") | str_starts(naics, "712") ~ "711AS",
+    str_starts(naics, "713")                             ~ "713",
+    str_starts(naics, "721")                             ~ "721",
+    str_starts(naics, "722")                             ~ "722",
+    str_starts(naics, "811") | str_starts(naics, "812") |
+      str_starts(naics, "813")                           ~ "81",
+    TRUE ~ NA_character_
+  ))
+
+# ── Step 4: Aggregate to BEA industry level (employment-weighted) ────────────
+wfh_industry <- oes_with_wfh %>%
+  filter(!is.na(bea_code), !is.na(wfh_score)) %>%
+  group_by(bea_code) %>%
+  summarise(
+    wfh_index     = weighted.mean(wfh_score, w = tot_emp, na.rm = TRUE),
+    n_occ         = n(),
+    total_emp_oes = sum(tot_emp, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("\n=== WFH INDEX BY INDUSTRY ===\n")
+wfh_industry %>%
+  arrange(desc(wfh_index)) %>%
+  print(n = 60)
+
+# Check which panel industries are missing a WFH score
+cat("\n=== PANEL INDUSTRIES WITH NO WFH SCORE ===\n")
+panel_merged3 %>%
+  distinct(bea_code, industry) %>%
+  anti_join(wfh_industry, by = "bea_code") %>%
+  print()
+
+# ── Step 5: Merge WFH index onto panel ───────────────────────────────────────
+panel_merged4 <- panel_merged3 %>%
+  left_join(wfh_industry %>% select(bea_code, wfh_index), by = "bea_code")
+
+cat("\n=== FINAL PANEL ===\n")
+cat("Rows:             ", nrow(panel_merged4), "\n")
+cat("Industries:       ", n_distinct(panel_merged4$bea_code), "\n")
+cat("Years:            ", min(panel_merged4$year), "–", max(panel_merged4$year), "\n")
+cat("Missing wfh_index:", sum(is.na(panel_merged4$wfh_index)), "\n")
+
+# Save final panel
+write_csv(panel_merged4, "../Data/Intermediate data/panel_mergedfinal.csv")
+cat("Saved → panel_mergedfinal.csv\n")
+
+head(panel_merged4)
+```
+
+---
+
+## Final Panel Check
+
+```{r}
+cat("=== COLUMN NAMES ===\n")
+names(panel_merged4)
+
+cat("\n=== SAMPLE ROWS ===\n")
+
+panel_merged4 %>%
+  select(bea_code, industry, year, ln_lp, aggregate_raw_aiie,
+         intelligence_index, wfh_index) %>%
+  slice_head(n = 10) %>%
+  print()
+
+cat("\n=== WFH INDEX DISTRIBUTION ===\n")
+summary(panel_merged4$wfh_index)
+
+wfh_check <- panel_merged4 %>%
+  group_by(bea_code) %>%
+  summarise(n_unique_wfh = n_distinct(wfh_index, na.rm = TRUE), .groups = "drop")
+
+cat("\nIndustries with more than one WFH value (should be 0):",
+    sum(wfh_check$n_unique_wfh > 1), "\n")
+```

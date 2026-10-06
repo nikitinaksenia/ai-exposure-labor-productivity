@@ -1,0 +1,2038 @@
+---
+title: 'AI Exposure and Labor Productivity'
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    df_print: paged
+  pdf_document:
+    toc: true
+subtitle: "Pooled OLS, First Differences, One-Way and Two-Way Fixed Effects"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  message   = FALSE,
+  warning   = FALSE,
+  fig.align = "center"
+)
+```
+
+# Packages
+
+```{r libraries}
+
+library(tidyverse)
+library(plm)            # panel estimators (pooled, FD, FE, TE, 2WE)
+library(lmtest)         # coeftest for clustered inference
+library(sandwich)       # robust covariance matrices
+library(modelsummary)   # publication-quality regression tables
+library(kableExtra)     # table styling
+library(broom)          # tidy() for plm
+library(ggrepel)        # non-overlapping point labels in graphs
+```
+
+# Data preparation
+
+$$
+\begin{aligned}
+\text{early\_x\_agg\_x\_intel\_raw}_{i,t}  &= \mathbf{1}[2016 \le t \le 2019]\;\times\; \text{AIIE}^{\text{agg,raw}}_{i,t}\;\times\;\text{Intel}_t \\
+\text{mature\_x\_lm\_x\_intel\_raw}_{i,t} &= \mathbf{1}[t \ge 2020]\;\times\; \text{AIIE}^{\text{LM,raw}}_{i,t}\;\times\;\text{Intel}_t
+\end{aligned}
+$$
+
+The `early_ai` window captures the **pre-LLM** discriminative-AI era when the
+**aggregate** Felten et al. (2021) measure best summarises overall AI exposure.
+The `mature_ai` window captures the **generative-AI** era (post-2019) where the
+**Language Modeling (LM)** sub-index is the relevant exposure measure for
+GPT-style productivity shocks.
+
+```{r load-data}
+panel_raw <- read_csv("../Data/Final Data Set/panel_mergedfinal.csv", show_col_types = FALSE)
+
+cat("Raw panel dimensions:", nrow(panel_raw), "rows ×",
+    ncol(panel_raw), "columns\n")
+cat("Year range:", min(panel_raw$year), "–", max(panel_raw$year), "\n")
+cat("Industries:", n_distinct(panel_raw$bea_code), "\n")
+```
+
+```{r build-panel}
+panel <- panel_raw %>%
+  filter(industry != "Farms") %>%
+  filter(year >= 2016, year <= 2024) %>%
+  arrange(bea_code, year) %>%
+  mutate(
+    # Phase indicators
+    early_ai  = as.integer(year >= 2016 & year <= 2019),
+    mature_ai = as.integer(year >= 2020),
+
+    # Triple interactions using RAW AIIE (key regressors) 
+    early_x_agg_x_intel_raw  = early_ai  * aggregate_raw_aiie * intelligence_index,
+    mature_x_lm_x_intel_raw  = mature_ai * lm_raw_aiie        * intelligence_index,
+    mature_x_ig_x_intel_raw  = mature_ai * ig_raw_aiie        * intelligence_index, 
+
+    #  - Symmetric placebo terms (used only in the symmetry check)
+    early_x_lm_x_intel_raw   = early_ai  * lm_raw_aiie        * intelligence_index,
+    mature_x_agg_x_intel_raw = mature_ai * aggregate_raw_aiie * intelligence_index,
+    covid_dummy = as.integer(year %in% c(2020, 2021)),
+    wfh_x_covid = wfh_index * covid_dummy,
+    
+    #  - Lag of employment (log)  
+    log_employment_lag1 = ifelse(is.na(employment_lag1) | employment_lag1 <= 0,
+                                 NA_real_, log(employment_lag1))
+  )
+
+cat("Working panel:\n")
+cat("  Rows:", nrow(panel), "\n")
+cat("  Industries:", n_distinct(panel$bea_code), "\n")
+cat("  Years:", paste(sort(unique(panel$year)), collapse = ", "), "\n\n")
+
+panel %>%
+  group_by(year) %>%
+  summarise(
+    N_total          = n(),
+    N_with_lp        = sum(!is.na(ln_lp)),
+    N_with_lag_emp   = sum(!is.na(log_employment_lag1)),
+    N_with_all_ctrls = sum(complete.cases(across(c(ln_lp,
+                                                   ict_capital_contrib,
+                                                   non_ict_capital_contrib,
+                                                   eng_contrib,
+                                                   log_employment_lag1,
+                                                   early_x_agg_x_intel_raw,
+                                                   mature_x_lm_x_intel_raw))))
+  ) %>%
+  knitr::kable(caption = "Observations available by year (unbalanced panel)")
+```
+
+```{r pdata-frame}
+# Converting to a panel data frame
+
+pdata <- pdata.frame(panel, index = c("bea_code", "year"))
+
+cat("plm panel structure:\n")
+pdim(pdata)
+```
+
+# Model specification
+
+The dependent variable is the log of the labor productivity index $\ln(LP)_{i,t}$.
+The benchmark equation is
+
+$$
+\ln LP_{i,t} = \beta_1\,\text{early\_x\_agg\_x\_intel\_raw}_{i,t}
+            + \beta_2\,\text{mature\_x\_lm\_x\_intel\_raw}_{i,t}
+            + \boldsymbol{\gamma}'\mathbf{X}_{i,t}
+            + \alpha_i + \delta_t + u_{i,t}
+$$
+
+with controls $\mathbf{X}_{i,t}$ comprising the **ICT-capital contribution**,
+**non-ICT capital contribution**, **energy-input contribution**, and
+**lagged log employment**. $\alpha_i$ are industry fixed effects, $\delta_t$
+are year fixed effects.
+
+```{r common-formula}
+
+fml <- ln_lp ~ early_x_agg_x_intel_raw + mature_x_lm_x_intel_raw +
+               ict_capital_contrib + non_ict_capital_contrib + eng_contrib +
+               log_employment_lag1
+```
+
+Standard errors are **clustered at the industry level** (`bea_code`) in every
+specification, using the panel-robust Arellano (1987) covariance matrix
+implemented in `plm::vcovHC(..., cluster = "group", type = "HC1")`. This is
+the appropriate cluster-robust estimator for short-T unbalanced panels.
+
+```{r se-helper}
+
+clse <- function(mod) {
+  vcovHC(mod, method = "arellano", type = "HC1", cluster = "group")
+}
+
+
+ct_print <- function(mod, label) {
+  cat("\n========== ", label, " ==========\n")
+  print(coeftest(mod, vcov = clse(mod)))
+  cat("\nN =", nobs(mod), " | Industries =",
+      length(unique(index(mod, "id"))),
+      " | Years =", length(unique(index(mod, "time"))), "\n")
+}
+```
+
+# Estimation
+
+We build up from pooled OLS (no panel structure) to the two-way fixed-effects
+specification.
+
+## (1) Pooled OLS
+
+```{r pooled-ols}
+m_pool <- plm(fml, data = pdata, model = "pooling")
+ct_print(m_pool, "Pooled OLS")
+```
+
+## (2) First differences
+
+The FD estimator differences out any time-invariant industry heterogeneity and,
+importantly, is robust to a unit root in $\ln LP$ — useful given that
+productivity indexes are typically near-integrated.
+
+```{r first-diff}
+m_fd <- plm(fml, data = pdata, model = "fd")
+ct_print(m_fd, "First Differences")
+```
+
+## (3) Industry fixed effects only
+
+```{r ind-fe}
+m_ife <- plm(fml, data = pdata, model = "within", effect = "individual")
+ct_print(m_ife, "Industry FE only")
+```
+
+## (4) Year (time) fixed effects only
+
+```{r time-fe}
+m_tfe <- plm(fml, data = pdata, model = "within", effect = "time")
+ct_print(m_tfe, "Time FE only")
+```
+
+## (5) Two-way fixed effects 
+
+```{r twoway-fe}
+m_2we <- plm(fml, data = pdata, model = "within", effect = "twoways")
+ct_print(m_2we, "Two-way FE")
+```
+
+## (6) Two-way fixed effects with Lag of LP 
+```{r}
+m_2weNEW <- plm(ln_lp ~ early_x_agg_x_intel_raw + mature_x_lm_x_intel_raw +
+               ict_capital_contrib + non_ict_capital_contrib + eng_contrib +
+               log_employment_lag1 + lag(ln_lp, 1), data = pdata, model = "within", effect = "twoways")
+ct_print(m_2weNEW, "Two-way FE (preferred)")
+
+```
+
+# Specification tests
+
+
+```{r diagnostics-fn}
+run_panel_diagnostics <- function(pooled, ife, tfe, twe, formula, pdata) {
+
+  htest_row <- function(test_name, decision_h0, h_obj) {
+    stat_val <- as.numeric(h_obj$statistic)
+    par      <- h_obj$parameter
+    df_str   <- if (length(par) == 2)
+                  sprintf("(%g, %g)", par[1], par[2])
+                else if (length(par) == 1) sprintf("(%g)", par[1])
+                else ""
+    p        <- as.numeric(h_obj$p.value)
+    tibble(
+      Test          = test_name,
+      `H 0`          = decision_h0,
+      Statistic     = sprintf("%.3f %s", stat_val, df_str),
+      `p-value`     = formatC(p, digits = 4, format = "g"),
+      Decision      = ifelse(p < 0.05, "Reject H 0 (5%)",
+                       ifelse(p < 0.10, "Reject H 0 (10%)", "Fail to reject H 0"))
+    )
+  }
+
+  # 1. Joint F-tests for fixed-effect significance 
+  f_tests <- bind_rows(
+    htest_row("Industry FE vs Pooled OLS",  "No industry effects",
+              pFtest(ife, pooled)),
+    htest_row("Year FE vs Pooled OLS",      "No time effects",
+              pFtest(tfe, pooled)),
+    htest_row("Two-way FE vs Pooled OLS",   "No effects (jointly)",
+              pFtest(twe, pooled)),
+    htest_row("Time effects given industry FE", "Year effects redundant after industry FE",
+              pFtest(twe, ife))
+  )
+
+  # 2. Hausman test (FE vs RE) on individual effects
+  m_re_ind <- try(
+    plm(formula, data = pdata, model = "random", effect = "individual",
+        random.method = "swar"),
+    silent = TRUE
+  )
+  hausman <- if (!inherits(m_re_ind, "try-error")) {
+    htest_row("Hausman: industry FE vs RE",
+              "RE consistent (orthogonal effects)",
+              phtest(ife, m_re_ind))
+  } else {
+    tibble(Test = "Hausman: industry FE vs RE",
+           `H 0` = "RE consistent",
+           Statistic = "—",
+           `p-value` = "—",
+           Decision = "RE estimator failed to converge")
+  }
+
+  # 3. Residual autocorrelation in the 2WE model
+  serial <- htest_row(
+    "Breusch-Godfrey / Wooldridge AR(1)",
+    "No serial correlation in errors",
+    pbgtest(twe)
+  )
+
+  # 4. Cross-sectional dependence (Pesaran)
+  csd_obj <- try(pcdtest(twe, test = "cd"), silent = TRUE)
+  csd <- if (!inherits(csd_obj, "try-error")) {
+    htest_row("Pesaran CD test", "Cross-sectional independence", csd_obj)
+  } else {
+    tibble(Test = "Pesaran CD test",
+           `H 0` = "Cross-sectional independence",
+           Statistic = "—", `p-value` = "—",
+           Decision = "Could not be computed (panel structure)")
+  }
+
+  # 5. Wald tests on the AI coefficients (clustered VCV) 
+  wald_chi2 <- function(mod, hyp_vec, label) {
+    cf  <- coef(mod); V <- clse(mod)
+    R   <- matrix(0, length(hyp_vec), length(cf), dimnames = list(NULL, names(cf)))
+    rhs <- numeric(length(hyp_vec))
+    for (j in seq_along(hyp_vec)) {
+      parts <- strsplit(hyp_vec[j], "=")[[1]] %>% trimws()
+      R[j, parts[1]] <- 1
+      if (length(parts) == 2 && parts[2] != "0") R[j, parts[2]] <- -1
+    }
+    Rb <- R %*% cf - rhs
+    W  <- as.numeric(t(Rb) %*% solve(R %*% V %*% t(R)) %*% Rb)
+    df <- length(hyp_vec)
+    p  <- pchisq(W, df, lower.tail = FALSE)
+    tibble(
+      Test      = label,
+      `H 0`      = paste(hyp_vec, collapse = "; "),
+      Statistic = sprintf("%.3f (df = %d)", W, df),
+      `p-value` = formatC(p, digits = 4, format = "g"),
+      Decision  = ifelse(p < 0.05, "Reject H 0 (5%)",
+                  ifelse(p < 0.10, "Reject H 0 (10%)", "Fail to reject H 0"))
+    )
+  }
+
+  wald <- bind_rows(
+    wald_chi2(twe,
+      c("early_x_agg_x_intel_raw", "mature_x_lm_x_intel_raw"),
+      "Joint significance of AI terms"),
+    wald_chi2(twe,
+      c("early_x_agg_x_intel_raw = mature_x_lm_x_intel_raw"),
+      "Early effect = Mature effect")
+  )
+
+  list(
+    `F-tests for fixed-effect significance`   = f_tests,
+    `Hausman test (FE vs RE)`                 = hausman,
+    `Residual autocorrelation tests`          = serial,
+    `Cross-sectional dependence`              = csd,
+    `Wald tests on AI coefficients (2WE)`     = wald
+  )
+}
+```
+
+```{r run-diagnostics}
+diag <- run_panel_diagnostics(
+  pooled  = m_pool, ife = m_ife, tfe = m_tfe, twe = m_2we,
+  formula = fml,    pdata = pdata
+)
+
+for (nm in names(diag)) {
+  kbl <- kable(diag[[nm]], caption = nm,
+               align = c("l","l","r","r","l")) |>
+    kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                  full_width = FALSE, position = "left") |>
+    row_spec(0, bold = TRUE)
+  print(kbl)
+  cat("\n\n")
+}
+```
+
+
+```{r reg-tablenew, results='asis'}
+library(htmltools)
+
+# 1. Cluster-robust covariance matrices
+vcov_list <- list(
+  "Pooled OLS"  = clse(m_pool),
+  "First Diff"  = clse(m_fd),
+  "Industry FE" = clse(m_ife),
+  "Year FE"     = clse(m_tfe),
+  "Two-way FE"  = clse(m_2we),
+  "Two-way FE with LP lag" = clse(m_2weNEW)
+)
+mods <- list(
+  "Pooled OLS"  = m_pool,
+  "First Diff"  = m_fd,
+  "Industry FE" = m_ife,
+  "Year FE"     = m_tfe,
+  "Two-way FE"  = m_2we,
+  "Two-way FE with LP lag" = m_2weNEW
+)
+
+# 2. Coefficient labels
+coef_map <- c(
+  "early_x_agg_x_intel_raw"  = "Early × Aggregate AIIE × Intel",
+  "mature_x_lm_x_intel_raw"  = "Mature × LM AIIE × Intel",
+  "ict_capital_contrib"      = "ICT-capital contribution",
+  "non_ict_capital_contrib"  = "Non-ICT capital contribution",
+  "eng_contrib"              = "Energy contribution",
+  "log_employment_lag1"      = "Log employment $_{t-1}$",
+  "lag(ln_lp, 1)"            = "ln(LP) $_{t-1}$",
+  "(Intercept)"              = "Constant"
+)
+
+# 3. GOF rows
+gof <- tibble::tribble(
+  ~raw,            ~clean,            ~fmt,
+  "nobs",          "Observations",    0,
+  "r.squared",     "R²",              3,
+  "adj.r.squared", "Adj. R²",         3
+)
+
+# 4. FE / cluster rows
+add_rows <- tibble::tribble(
+  ~term,                      ~`Pooled OLS`, ~`First Diff`,    ~`Industry FE`, ~`Year FE`, ~`Two-way FE`, ~`Two-way FE with LP lag`,
+  "Industry fixed effects",   "No",          "Differenced out", "Yes",          "No",       "Yes", "Yes",
+  "Year fixed effects",       "No",          "No",              "No",           "Yes",      "Yes", "Yes",
+  "SE cluster",               "Industry",    "Industry",        "Industry",     "Industry", "Industry", "Industry"
+)
+attr(add_rows, "position") <- NULL
+
+# 5. HTML
+raw <- modelsummary(
+  mods,
+  vcov         = vcov_list,
+  coef_map     = coef_map,
+  gof_map      = gof,
+  add_rows     = add_rows,
+  stars        = c('*' = .1, '**' = .05, '***' = .01),
+  title        = "AI Exposure and Labor Productivity (clustered SEs in parentheses)",
+  notes        = c(
+    "Dependent variable: ln(LP) — log of the BLS labor productivity index.",
+    "Sample: 59 BEA industries, 2016–2024 (Farms excluded).",
+    "Standard errors clustered at the industry level (HC1).",
+    "Lagged employment causes 2016 to drop in specifications (1)–(5)."
+  ),
+  output = "kableExtra"
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                position = "center") %>%
+  row_spec(0, bold = TRUE) %>%
+  as.character()
+
+raw <- gsub("&amp;nbsp;", "", raw, fixed = TRUE)
+raw <- gsub("&nbsp;",     "", raw, fixed = TRUE)
+raw <- gsub("\u00A0",     "", raw, fixed = TRUE)
+
+HTML(raw)
+```
+
+
+# Robustness — variations on the two-way FE model
+
+```{r robustness-2we, results='asis'}
+
+# 1. Full panel for the structural-break specification
+panel_full <- panel_raw %>%
+  filter(industry != "Farms") %>%
+  arrange(bea_code, year) %>%
+  mutate(
+    ai_exposure = aggregate_raw_aiie * intelligence_index,
+    covid_dummy = as.integer(year %in% c(2020, 2021)),
+    wfh_x_covid = wfh_index * covid_dummy
+  )
+pdata_full <- pdata.frame(panel_full, index = c("bea_code", "year"))
+
+# 2. Working panel with raw (un-logged) lag of employment
+panel_rawlag <- panel %>%
+  mutate(
+    employment_lag1_clean = ifelse(employment_lag1 <= 0 | is.na(employment_lag1),
+                                   NA_real_, employment_lag1),
+    covid_dummy = as.integer(year %in% c(2020, 2021)),
+    wfh_x_covid = wfh_index * covid_dummy
+  )
+pdata_rawlag <- pdata.frame(panel_rawlag, index = c("bea_code", "year"))
+
+# 3. Unbalanced AIIE panel
+panel_unbal <- panel_raw %>%
+  filter(industry != "Farms") %>%
+  arrange(bea_code, year) %>%
+  mutate(
+    across(c(aggregate_raw_aiie, lm_raw_aiie, ig_raw_aiie),
+           ~ ifelse(. == 0, NA_real_, .)),
+    early_ai  = as.integer(year >= 2016 & year <= 2019),
+    mature_ai = as.integer(year >= 2020),
+    early_x_agg_x_intel_raw  = early_ai  * aggregate_raw_aiie * intelligence_index,
+    mature_x_lm_x_intel_raw  = mature_ai * lm_raw_aiie        * intelligence_index,
+    mature_x_ig_x_intel_raw  = mature_ai * ig_raw_aiie        * intelligence_index,
+    covid_dummy = as.integer(year %in% c(2020, 2021)),
+    wfh_x_covid = wfh_index * covid_dummy,
+    log_employment_lag1 = ifelse(is.na(employment_lag1) | employment_lag1 <= 0,
+                                  NA_real_, log(employment_lag1))
+  )
+pdata_unbal <- pdata.frame(panel_unbal, index = c("bea_code", "year"))
+
+# 4. Full panel with phase dummies (no employment control) 
+panel_full_em <- panel_raw %>%
+  filter(industry != "Farms") %>%
+  arrange(bea_code, year) %>%
+  mutate(
+    early_ai  = as.integer(year >= 2016 & year <= 2019),
+    mature_ai = as.integer(year >= 2020),
+    early_x_agg_x_intel_raw = early_ai  * aggregate_raw_aiie * intelligence_index,
+    mature_x_lm_x_intel_raw = mature_ai * lm_raw_aiie        * intelligence_index,
+    covid_dummy = as.integer(year %in% c(2020, 2021)),
+    wfh_x_covid = wfh_index * covid_dummy
+  )
+pdata_full_em <- pdata.frame(panel_full_em, index = c("bea_code", "year"))
+
+# ── Models ──
+
+# (1) Baseline
+m_aa <- plm(ln_lp ~ early_x_agg_x_intel_raw + mature_x_lm_x_intel_raw +
+                   ict_capital_contrib + non_ict_capital_contrib + eng_contrib +
+                   log_employment_lag1 + wfh_x_covid,
+           data = pdata, model = "within", effect = "twoways")
+
+# (2) Adding Image-Generation AIIE term in the mature period
+m2 <- plm(ln_lp ~ early_x_agg_x_intel_raw + mature_x_lm_x_intel_raw +
+                  mature_x_ig_x_intel_raw +
+                  ict_capital_contrib + non_ict_capital_contrib + eng_contrib +
+                  log_employment_lag1 + wfh_x_covid,
+          data = pdata, model = "within", effect = "twoways")
+
+# (3) Levels rather than logs of LP
+m3 <- plm(lp_index ~ early_x_agg_x_intel_raw + mature_x_lm_x_intel_raw +
+                     ict_capital_contrib + non_ict_capital_contrib + eng_contrib +
+                     log_employment_lag1 + wfh_x_covid,
+          data = pdata, model = "within", effect = "twoways")
+
+# (4) Dropping employment lag
+m4 <- plm(ln_lp ~ early_x_agg_x_intel_raw + mature_x_lm_x_intel_raw +
+                  ict_capital_contrib + non_ict_capital_contrib + eng_contrib +
+                  wfh_x_covid,
+          data = pdata, model = "within", effect = "twoways")
+
+# (5) Full 1997–2024 panel with phase dummies
+m_f <- plm(ln_lp ~ early_x_agg_x_intel_raw + mature_x_lm_x_intel_raw +
+                   ict_capital_contrib + non_ict_capital_contrib + eng_contrib +
+                   wfh_x_covid,
+           data = pdata_full_em, model = "within", effect = "twoways")
+
+# (6) Single AI×Intel term on full panel
+m_b <- plm(ln_lp ~ ai_exposure + ict_capital_contrib + non_ict_capital_contrib +
+                   eng_contrib + wfh_x_covid,
+           data = pdata_full, model = "within", effect = "twoways")
+
+# (7) Raw lag of employment instead of log
+m_c <- plm(ln_lp ~ early_x_agg_x_intel_raw + mature_x_lm_x_intel_raw +
+                   ict_capital_contrib + non_ict_capital_contrib + eng_contrib +
+                   employment_lag1_clean + wfh_x_covid,
+           data = pdata_rawlag, model = "within", effect = "twoways")
+
+# (8) ln(TFP) as the dependent variable
+m_d <- plm(ln_tfp ~ early_x_agg_x_intel_raw + mature_x_lm_x_intel_raw +
+                    ict_capital_contrib + non_ict_capital_contrib + eng_contrib +
+                    log_employment_lag1 + wfh_x_covid,
+           data = pdata, model = "within", effect = "twoways")
+
+# (9) Unbalanced AIIE panel 
+m_e <- plm(ln_lp ~ early_x_agg_x_intel_raw + mature_x_lm_x_intel_raw +
+                   ict_capital_contrib + non_ict_capital_contrib + eng_contrib +
+                   log_employment_lag1 + wfh_x_covid,
+           data = pdata_unbal, model = "within", effect = "twoways")
+
+# ── Cluster-robust SEs ──
+vcov_rob <- list(
+  "Baseline 2WE"           = clse(m_aa),
+  "Include Image Gen"      = clse(m2),
+  "Absolute productivity"  = clse(m3),
+  "No emp. control"        = clse(m4),
+  "Full panel, phases"     = clse(m_f),
+  "One structural break"   = clse(m_b),
+  "Raw emp. lag"           = clse(m_c),
+  "TFP as DV"              = clse(m_d),
+  "AIIE zeros = NA"        = clse(m_e)
+)
+
+mods_rob <- list(
+  "Baseline 2WE"           = m_aa,
+  "Include Image Gen"      = m2,
+  "Absolute productivity"  = m3,
+  "No emp. control"        = m4,
+  "Full panel, phases"     = m_f,
+  "One structural break"   = m_b,
+  "Raw emp. lag"           = m_c,
+  "TFP as DV"              = m_d,
+  "AIIE zeros = NA"        = m_e
+)
+
+coef_map_rob <- c(
+  "early_x_agg_x_intel_raw"  = "Early × Aggregate AIIE × Intel",
+  "mature_x_lm_x_intel_raw"  = "Mature × LM AIIE × Intel",
+  "mature_x_ig_x_intel_raw"  = "Mature × IG AIIE × Intel",
+  "wfh_x_covid"              = "WFH index × COVID dummy",
+  "ai_exposure"              = "AIIE × Intel (single term)",
+  "ict_capital_contrib"      = "ICT-capital contribution",
+  "non_ict_capital_contrib"  = "Non-ICT capital contribution",
+  "eng_contrib"              = "Energy contribution",
+  "log_employment_lag1"      = "Log employment $_{t-1}$",
+  "employment_lag1_clean"    = "Employment $_{t-1}$ (raw)"
+)
+
+add_rows_rob <- tibble::tribble(
+  ~term,            ~`Baseline 2WE`, ~`Include Image Gen`, ~`Absolute productivity`, ~`No emp. control`, ~`Full panel, phases`, ~`One structural break`, ~`Raw emp. lag`, ~`TFP as DV`, ~`AIIE zeros = NA`,
+  "Dependent var",  "ln(LP)",        "ln(LP)",             "LP (level)",             "ln(LP)",           "ln(LP)",              "ln(LP)",                "ln(LP)",        "ln(TFP)",    "ln(LP)",
+  "Sample years",   "2017–2024",     "2017–2024",          "2017–2024",              "2017–2024",        "1997–2024",           "1997–2024",             "2017–2024",     "2017–2024",  "2017–2024",
+  "Industry FE",    "Yes",           "Yes",                "Yes",                    "Yes",              "Yes",                 "Yes",                   "Yes",           "Yes",        "Yes",
+  "Year FE",        "Yes",           "Yes",                "Yes",                    "Yes",              "Yes",                 "Yes",                   "Yes",           "Yes",        "Yes",
+  "Cluster (SE)",   "Industry",      "Industry",           "Industry",               "Industry",         "Industry",            "Industry",              "Industry",      "Industry",   "Industry"
+)
+
+gof_rob <- tibble::tribble(
+  ~raw,            ~clean,            ~fmt,
+  "nobs",          "Observations",    0,
+  "r.squared",     "R²",              3,
+  "adj.r.squared", "Adj. R²",         3
+)
+
+raw_rob <- modelsummary(
+  mods_rob,
+  vcov     = vcov_rob,
+  coef_map = coef_map_rob,
+  gof_map  = gof_rob,
+  add_rows = add_rows_rob,
+  stars    = c('*' = .1, '**' = .05, '***' = .01),
+  title    = "Robustness: variations on the two-way fixed-effects model (clustered SEs in parentheses)",
+  notes    = c(
+    "All columns: two-way fixed effects (industry + year), industry-clustered SEs (Arellano HC1).",
+    "All columns include WFH × COVID, where COVID = 1 for 2020–2021 and 0 otherwise; identification of this interaction comes from cross-industry variation in WFH exposure during the 2020–2021 window (the COVID dummy alone is absorbed by year FE).",
+    "(1) Baseline reproduces column (5) of the main regression table.",
+    "(2) Adds the mature × IG AIIE × Intel term to test for image-generation exposure effects.",
+    "(3) Levels of the LP index instead of the log.",
+    "(4) Drops lagged employment (reverse-causality concern: AI may itself cause employment changes).",
+    "(5) Estimates the early/mature decomposition on the full 1997–2024 panel; lagged employment dropped (unavailable pre-2016).",
+    "(6) Single AI×Intel term on the 1997–2024 panel; mechanically zero before 2016.",
+    "(7) Replaces log(employment_{t-1}) with the raw level.",
+    "(8) Substitutes ln(TFP) for ln(LP) as the dependent variable.",
+    "(9) Recodes zeros in aggregate / LM / IG raw AIIE as NA, making the panel explicitly unbalanced in AI exposure."
+  ),
+  output = "kableExtra"
+) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, position = "center") %>%
+  row_spec(0, bold = TRUE) %>%
+  add_header_above(c(" " = 1, "(1)" = 1, "(2)" = 1, "(3)" = 1, "(4)" = 1,
+                    "(5)" = 1, "(6)" = 1, "(7)" = 1, "(8)" = 1, "(9)" = 1)) %>%
+  as.character()
+
+raw_rob <- gsub("&amp;nbsp;", "", raw_rob, fixed = TRUE)
+raw_rob <- gsub("&nbsp;",     "", raw_rob, fixed = TRUE)
+raw_rob <- gsub("\u00A0",     "", raw_rob, fixed = TRUE)
+
+HTML(raw_rob)
+```
+
+
+
+## Robustness: symmetric (placebo) phase × AIIE matrix
+
+```{r symmetric}
+fml_sym <- ln_lp ~ early_x_agg_x_intel_raw + mature_x_agg_x_intel_raw +
+                   early_x_lm_x_intel_raw  + mature_x_lm_x_intel_raw  +
+                   ict_capital_contrib + non_ict_capital_contrib + eng_contrib +
+                   log_employment_lag1
+
+m_sym <- plm(fml_sym, data = pdata, model = "within", effect = "twoways")
+
+modelsummary(
+  list("Two-way FE — symmetric matrix" = m_sym),
+  vcov     = list(clse(m_sym)),
+  coef_map = c(
+    "early_x_agg_x_intel_raw"   = "Early × Aggregate × Intel  (focal)",
+    "mature_x_lm_x_intel_raw"   = "Mature × LM × Intel        (focal)",
+    "early_x_lm_x_intel_raw"    = "Early × LM × Intel         (placebo)",
+    "mature_x_agg_x_intel_raw"  = "Mature × Aggregate × Intel (placebo)",
+    "ict_capital_contrib"       = "ICT-capital contribution",
+    "non_ict_capital_contrib"   = "Non-ICT capital contribution",
+    "eng_contrib"               = "Energy contribution",
+    "log_employment_lag1"       = "Log employment $_{t-1}$"
+  ),
+  gof_map = gof,
+  stars   = c('*' = .1, '**' = .05, '***' = .01),
+  title   = "Symmetric phase × AIIE matrix (placebo check)",
+  output  = "kableExtra"
+) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE)
+```
+
+##### Graphs
+
+# Descriptive graphs
+
+
+```{r plot-setup}
+library(ggplot2)
+library(scales)
+
+# A clean, paper-ready theme
+theme_paper <- theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_blank(),
+    plot.title         = element_text(face = "bold", size = 12),
+    plot.subtitle      = element_text(size = 10, colour = "grey30"),
+    legend.position    = "bottom",
+    strip.text         = element_text(face = "bold")
+  )
+
+focal_industries <- c(
+  "Computer and electronic products",
+  "Publishing industries, except internet (includes software)",
+  "Wholesale trade",
+  "Construction",
+  "Retail trade",
+  "Forestry, fishing, and related activities",
+  "Mining, except oil and gas",
+  "Chemical products"
+)
+
+short_lab <- function(x, n = 26) ifelse(nchar(x) > n,
+                                        paste0(substr(x, 1, n - 1), "…"), x)
+```
+
+## (a) Distribution of AIIE measures across industries, by year
+
+```{r plot-aiie-distributions, fig.width=9, fig.height=4}
+aiie_long <- panel %>%
+  select(bea_code, industry, year,
+         aggregate_raw_aiie, lm_raw_aiie, ig_raw_aiie) %>%
+  pivot_longer(cols = ends_with("aiie"),
+               names_to = "measure", values_to = "value") %>%
+  mutate(
+    measure = dplyr::recode(measure,
+      aggregate_raw_aiie = "Aggregate AIIE",
+      lm_raw_aiie        = "Language-Modeling AIIE",
+      ig_raw_aiie        = "Image-Generation AIIE"
+    ),
+    measure = factor(measure, levels = c("Aggregate AIIE",
+                                         "Language-Modeling AIIE",
+                                         "Image-Generation AIIE"))
+  )
+
+ggplot(aiie_long, aes(x = factor(year), y = value, fill = measure)) +
+  geom_boxplot(outlier.size = 0.7, alpha = 0.85, colour = "grey25") +
+  facet_wrap(~ measure, nrow = 1) +
+  scale_fill_brewer(palette = "Set2", guide = "none") +
+  labs(
+    title    = "Distribution of raw AIIE measures across industries, 2016–2024",
+    subtitle = "Each box pools the 59 BEA industries; whiskers = 1.5×IQR",
+    x = NULL, y = "Raw AIIE (industry-year value)"
+  ) +
+  theme_paper
+```
+
+## (b) AIIE trajectories for selected industries
+
+```{r plot-aiie-trajectories, fig.width=9, fig.height=5}
+aiie_focal <- aiie_long %>%
+  filter(industry %in% focal_industries) %>%
+  mutate(industry_short = short_lab(industry, 30))
+
+ggplot(aiie_focal,
+       aes(x = year, y = value, colour = industry_short, group = industry_short)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.6) +
+  facet_wrap(~ measure, nrow = 1, scales = "fixed") +
+  scale_colour_brewer(palette = "Dark2", name = NULL) +
+  scale_x_continuous(breaks = 2016:2024) +
+  labs(
+    title    = "AIIE trajectories, 2016–2024 — selected industries",
+    subtitle = "Variation comes from yearly O*NET abilities revisions",
+    x = NULL, y = "Raw AIIE"
+  ) +
+  theme_paper +
+  theme(legend.text = element_text(size = 8))
+```
+
+## (c) GenAI capability index over time
+
+```{r plot-intel-index, fig.width=7, fig.height=3.5}
+panel %>%
+  distinct(year, intelligence_index) %>%
+  ggplot(aes(x = year, y = intelligence_index)) +
+  geom_area(fill = "steelblue", alpha = 0.25) +
+  geom_line(colour = "steelblue4", linewidth = 1.1) +
+  geom_point(colour = "steelblue4", size = 2.5) +
+  geom_vline(xintercept = 2019.5, linetype = "dashed", colour = "grey40") +
+  annotate("text", x = 2017.5, y = 0.30, label = "Early AI\n(2016–19)",
+           colour = "grey25", size = 3) +
+  annotate("text", x = 2022.5, y = 0.05, label = "Mature/GenAI\n(2020–24)",
+           colour = "grey25", size = 3) +
+  scale_x_continuous(breaks = 2016:2024) +
+  labs(
+    title    = "Intelligence index — economy-wide GenAI capability over time",
+    subtitle = "Dashed line marks the early/mature phase boundary used in the regressions",
+    x = NULL, y = "Intelligence index"
+  ) +
+  theme_paper
+```
+
+## (d) Productivity trajectories by industry
+
+```{r plot-lp-trajectories, fig.width=9, fig.height=5}
+panel %>%
+  group_by(bea_code) %>%
+  mutate(ln_lp_2016 = first(ln_lp[year == 2016]),
+         ln_lp_norm = ln_lp - ln_lp_2016) %>%
+  ungroup() %>%
+  mutate(highlight = industry %in% focal_industries,
+         industry_short = short_lab(industry, 32)) %>%
+  ggplot(aes(x = year, y = ln_lp_norm, group = bea_code)) +
+  geom_line(data = . %>% filter(!highlight),
+            colour = "grey80", linewidth = 0.4) +
+  geom_line(data = . %>% filter(highlight),
+            aes(colour = industry_short), linewidth = 1) +
+  scale_colour_brewer(palette = "Dark2", name = NULL) +
+  scale_x_continuous(breaks = 2016:2024) +
+  labs(
+    title    = "Labor productivity index, normalised to 2016",
+    subtitle = "Grey lines: all 59 industries. Coloured: focal industries",
+    x = NULL, y = "ln(LP) - ln(LP, 2016)"
+  ) +
+  theme_paper +
+  theme(legend.text = element_text(size = 8))
+```
+
+## (e) Employment vs productivity changes (2016 → 2022)
+
+```{r plot-emp-vs-lp, fig.width=8, fig.height=6}
+emp_lp_change <- panel %>%
+  group_by(bea_code, industry) %>%
+  summarise(
+    d_ln_lp   = ln_lp[year == 2024] - ln_lp[year == 2016],
+    d_log_emp = ifelse(any(year == 2024 & employment > 0) &
+                       any(year == 2016 & employment > 0),
+                       log(employment[year == 2024]) -
+                       log(employment[year == 2016]),
+                       NA_real_),,
+    avg_aiie = mean(aggregate_raw_aiie, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(d_ln_lp), !is.na(d_log_emp))
+
+to_label <- emp_lp_change %>%
+  filter(rank(-d_ln_lp) <= 4 | rank(d_ln_lp) <= 4 |
+         rank(-d_log_emp) <= 4 | rank(d_log_emp) <= 4 |
+         rank(-avg_aiie) <= 3 | rank(avg_aiie) <= 3) %>%
+  distinct(bea_code, .keep_all = TRUE) %>%
+  mutate(industry = short_lab(industry, 30))
+
+ggplot(emp_lp_change, aes(x = d_log_emp, y = d_ln_lp, colour = avg_aiie)) +
+  geom_hline(yintercept = 0, colour = "grey80") +
+  geom_vline(xintercept = 0, colour = "grey80") +
+  geom_point(size = 3, alpha = 0.85) +
+  ggrepel::geom_text_repel(
+    data = to_label, aes(label = industry),
+    size = 3, colour = "grey20", box.padding = 0.3, max.overlaps = 20
+  ) +
+  scale_colour_distiller(palette = "RdYlBu", direction = -1,
+                         name = "Avg. aggregate\nAIIE (2016–22)") +
+  labs(
+    title    = "Employment vs labor-productivity growth, 2016–2024",
+    subtitle = "One point per industry. Hot colours = higher AI exposure",
+    x = "Chng in log employment (2016 → 2022)",
+    y = "Chng in ln(labor productivity) (2016 → 2022)"
+  ) +
+  theme_paper
+```
+
+## (f) Heatmap of the focal triple interactions
+
+```{r plot-heatmap-interactions, fig.width=9, fig.height=8}
+hm_data <- panel %>%
+  mutate(
+    `Early × Aggregate × Intel`  = early_x_agg_x_intel_raw,
+    `Mature × LM × Intel`        = mature_x_lm_x_intel_raw
+  ) %>%
+  select(industry, year, `Early × Aggregate × Intel`, `Mature × LM × Intel`) %>%
+  pivot_longer(cols = c(`Early × Aggregate × Intel`, `Mature × LM × Intel`),
+               names_to = "measure", values_to = "value") %>%
+  mutate(industry_short = short_lab(industry, 38))
+
+ord <- hm_data %>%
+  group_by(industry_short) %>%
+  summarise(s = sum(abs(value), na.rm = TRUE)) %>%
+  arrange(s) %>% pull(industry_short)
+
+hm_data %>%
+  mutate(industry_short = factor(industry_short, levels = ord)) %>%
+  ggplot(aes(x = factor(year), y = industry_short, fill = value)) +
+  geom_tile(colour = "white", linewidth = 0.15) +
+  facet_wrap(~ measure, nrow = 1) +
+  scale_fill_gradient2(low = "#2c7fb8", mid = "white", high = "#d7301f",
+                       midpoint = 0, name = "Value") +
+  labs(
+    title    = "Identifying variation in the two focal triple interactions",
+    subtitle = "Zero (white) cells contribute nothing to the corresponding beta",
+    x = NULL, y = NULL
+  ) +
+  theme_paper +
+  theme(axis.text.y = element_text(size = 6),
+        legend.position = "right")
+```
+
+
+
+# Discussion
+
+# Full-panel regression table (1997–2024)
+
+```{r build-full-panel}
+# Re-building the panel on the full 1997–2024 window
+panel_fp <- panel_raw %>%
+  filter(industry != "Farms") %>%
+  arrange(bea_code, year) %>%
+  mutate(
+    early_ai  = as.integer(year >= 2016 & year <= 2019),
+    mature_ai = as.integer(year >= 2020),
+
+    early_x_agg_x_intel_raw  = early_ai  * aggregate_raw_aiie * intelligence_index,
+    mature_x_lm_x_intel_raw  = mature_ai * lm_raw_aiie        * intelligence_index,
+    mature_x_ig_x_intel_raw  = mature_ai * ig_raw_aiie        * intelligence_index,
+
+    # NEW: COVID period dummy and WFH × COVID interaction
+    covid_dummy = as.integer(year %in% c(2020, 2021)),
+    wfh_x_covid = wfh_index * covid_dummy,
+
+    log_employment_lag1 = ifelse(is.na(employment_lag1) | employment_lag1 <= 0,
+                                  NA_real_, log(employment_lag1))
+  )
+pdata_fp <- pdata.frame(panel_fp, index = c("bea_code", "year"))
+
+cat("Full panel dimensions:\n")
+cat("  Rows:", nrow(panel_fp), "\n")
+cat("  Industries:", n_distinct(panel_fp$bea_code), "\n")
+cat("  Years:", min(panel_fp$year), "–", max(panel_fp$year), "\n")
+```
+
+```{r reg-table-fullpanel, results='asis'}
+# ── Formulas ──
+fml_fp <- ln_lp ~ early_x_agg_x_intel_raw + mature_x_lm_x_intel_raw +
+                  ict_capital_contrib + non_ict_capital_contrib + eng_contrib
+
+fml_fp_lp_lag <- ln_lp ~ early_x_agg_x_intel_raw + mature_x_lm_x_intel_raw +
+                         ict_capital_contrib + non_ict_capital_contrib +
+                         eng_contrib + lag(ln_lp, 1) + wfh_x_covid
+
+fml_fp_both_lags <- ln_lp ~ early_x_agg_x_intel_raw + mature_x_lm_x_intel_raw +
+                            ict_capital_contrib + non_ict_capital_contrib +
+                            eng_contrib + lag(ln_lp, 1) + log_employment_lag1 + wfh_x_covid
+
+fml_fp_emp_only <- ln_lp ~ early_x_agg_x_intel_raw + mature_x_lm_x_intel_raw +
+                           ict_capital_contrib + non_ict_capital_contrib +
+                           eng_contrib + log_employment_lag1 + wfh_x_covid
+
+fml_fp_wfh <- ln_lp ~ early_x_agg_x_intel_raw + mature_x_lm_x_intel_raw +
+                      ict_capital_contrib + non_ict_capital_contrib + eng_contrib +
+                      wfh_x_covid
+
+# Five base specifications (no lags), full 1997–2024 panel 
+m_pool_fp <- plm(fml_fp, data = pdata_fp, model = "pooling")
+m_fd_fp   <- plm(fml_fp, data = pdata_fp, model = "fd")
+m_ife_fp  <- plm(fml_fp, data = pdata_fp, model = "within", effect = "individual")
+m_tfe_fp  <- plm(fml_fp, data = pdata_fp, model = "within", effect = "time")
+m_2we_fp  <- plm(fml_fp, data = pdata_fp, model = "within", effect = "twoways")
+
+
+# Column 6: adding LP lag 
+m_2we_fp_lp <- plm(fml_fp_lp_lag, data = pdata_fp,
+                   model = "within", effect = "twoways")
+
+# Column 7: adding both LP lag and log_employment_lag1 
+m_2we_fp_both <- plm(fml_fp_both_lags, data = pdata_fp,
+                     model = "within", effect = "twoways")
+
+# Column 8: adding only log_employment_lag1
+m_2we_fp_emp <- plm(fml_fp_emp_only, data = pdata_fp,
+                    model = "within", effect = "twoways")
+
+# Column 9: spec (5) + WFH × COVID interaction 
+m_2we_fp_wfh <- plm(fml_fp_wfh, data = pdata_fp,
+                    model = "within", effect = "twoways")
+
+# ── Cluster-robust SEs ──
+vcov_fp <- list(
+  "Pooled OLS"      = clse(m_pool_fp),
+  "First Diff"      = clse(m_fd_fp),
+  "Industry FE"     = clse(m_ife_fp),
+  "Year FE"         = clse(m_tfe_fp),
+  "Two-way FE"      = clse(m_2we_fp),
+  "+ LP lag"        = clse(m_2we_fp_lp),
+  "+ LP lag + emp." = clse(m_2we_fp_both),
+  "+ emp. lag"      = clse(m_2we_fp_emp),
+  "+ WFH × COVID"   = clse(m_2we_fp_wfh)
+)
+
+mods_fp <- list(
+  "Pooled OLS"      = m_pool_fp,
+  "First Diff"      = m_fd_fp,
+  "Industry FE"     = m_ife_fp,
+  "Year FE"         = m_tfe_fp,
+  "Two-way FE"      = m_2we_fp,
+  "+ LP lag"        = m_2we_fp_lp,
+  "+ LP lag + emp." = m_2we_fp_both,
+  "+ emp. lag"      = m_2we_fp_emp,
+  "BASE + WFH"   = m_2we_fp_wfh
+)
+
+coef_map_fp <- c(
+  "early_x_agg_x_intel_raw"  = "Early × Aggregate AIIE × Intel",
+  "mature_x_lm_x_intel_raw"  = "Mature × LM AIIE × Intel",
+  "wfh_x_covid"              = "WFH index × COVID dummy",
+  "ict_capital_contrib"      = "ICT-capital contribution",
+  "non_ict_capital_contrib"  = "Non-ICT capital contribution",
+  "eng_contrib"              = "Energy contribution",
+  "lag(ln_lp, 1)"            = "ln(LP)_t-1",
+  "log_employment_lag1"      = "Log employment_t-1",
+  "(Intercept)"              = "Constant"
+)
+
+gof_fp <- tibble::tribble(
+  ~raw,            ~clean,            ~fmt,
+  "nobs",          "Observations",    0,
+  "r.squared",     "R²",              3,
+  "adj.r.squared", "Adj. R²",         3
+)
+
+add_rows_fp <- tibble::tribble(
+  ~term,                       ~`Pooled OLS`, ~`First Diff`,    ~`Industry FE`, ~`Year FE`, ~`Two-way FE`, ~`+ LP lag`, ~`+ LP lag + emp.`, ~`+ emp. lag`, ~`BASE + WFH`,
+  "Industry fixed effects",    "No",          "Differenced out","Yes",          "No",       "Yes",         "Yes",       "Yes",              "Yes",         "Yes",
+  "Year fixed effects",        "No",          "No",             "No",           "Yes",      "Yes",         "Yes",       "Yes",              "Yes",         "Yes",
+  "Sample years",              "1997–2024",   "1997–2024",      "1997–2024",    "1997–2024","1997–2024",   "1998–2024", "2017–2024",        "2017–2024",   "1997–2024",
+  "SE cluster",                "Industry",    "Industry",       "Industry",     "Industry", "Industry",    "Industry",  "Industry",         "Industry",    "Industry"
+)
+attr(add_rows_fp, "position") <- NULL
+
+raw_fp <- modelsummary(
+  mods_fp,
+  vcov         = vcov_fp,
+  coef_map     = coef_map_fp,
+  gof_map      = gof_fp,
+  add_rows     = add_rows_fp,
+  stars        = c('*' = .1, '**' = .05, '***' = .01),
+  title        = "AI Exposure and Labor Productivity — Full panel (1997–2024) build-up (clustered SEs in parentheses)",
+  notes        = c(
+    "Dependent variable: ln(LP) — log of the BLS labor productivity index.",
+    "Columns (1)–(5) drop both the LP lag and lagged employment, allowing the full 1997–2024 panel.",
+    "Column (6) adds ln(LP)_{t-1}; first-year observations drop because of the lag.",
+    "Column (7) adds both ln(LP)_{t-1} and log(employment)_{t-1}; lagged employment is unavailable pre-2016, mechanically reducing the sample to 2017–2024.",
+    "Column (8) adds only log(employment)_{t-1}; same 2017–2024 restriction as (7) but without the LP lag (matches the original 2016–2024 baseline).",
+    "Pre-2016 observations contribute zero to the AI interactions by construction.",
+    "Standard errors clustered at the industry level (HC1).",
+    "Column (9) augments specification (5) with WFH × COVID, where COVID = 1 for 2020–2021 and 0 otherwise. The COVID dummy alone is absorbed by year FE; identification of the interaction comes from cross-industry variation in WFH exposure during the 2020–2021 window."
+  ),
+  output = "kableExtra"
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                position = "center") %>%
+  row_spec(0, bold = TRUE) %>%
+  add_header_above(c(" " = 1, "(1)" = 1, "(2)" = 1, "(3)" = 1, "(4)" = 1,
+                   "(5)" = 1, "(6)" = 1, "(7)" = 1, "(8)" = 1, "(9)" = 1)) %>%
+  as.character()
+
+# Strip the leaked non-breaking spaces (same fix as elsewhere)
+raw_fp <- gsub("&amp;nbsp;", "", raw_fp, fixed = TRUE)
+raw_fp <- gsub("&nbsp;",     "", raw_fp, fixed = TRUE)
+raw_fp <- gsub("\u00A0",     "", raw_fp, fixed = TRUE)
+
+htmltools::HTML(raw_fp)
+```
+
+
+
+```{r}
+library(car)
+vif(lm(ln_lp ~ early_x_agg_x_intel_raw + mature_x_lm_x_intel_raw +
+              ict_capital_contrib + non_ict_capital_contrib + eng_contrib +
+              lag(ln_lp, 1) + log_employment_lag1 +
+              factor(bea_code) + factor(year),
+       data = panel_fp))
+```
+
+# Collinearity diagnostics for column (7)
+
+```{r vif-collinearity, results='asis'}
+# 1. Within-transformed correlation matrix
+fe_demean <- function(x, ind, time) {
+  d <- ave(x, ind,  FUN = function(v) v - mean(v, na.rm = TRUE))
+  d <- ave(d, time, FUN = function(v) v - mean(v, na.rm = TRUE))
+  d
+}
+
+df_check <- model.frame(m_2we_fp_both)
+ind   <- as.character(index(m_2we_fp_both, "id"))
+time  <- as.character(index(m_2we_fp_both, "time"))
+
+X_within <- sapply(df_check[, -1, drop = FALSE],
+                   fe_demean, ind = ind, time = time)
+
+cor_within <- cor(X_within, use = "pairwise.complete.obs")
+
+# Mapping raw variable names 
+nice_names <- c(
+  "early_x_agg_x_intel_raw"  = "Early × Agg × Intel",
+  "mature_x_lm_x_intel_raw"  = "Mature × LM × Intel",
+  "ict_capital_contrib"      = "ICT-capital contrib.",
+  "non_ict_capital_contrib"  = "Non-ICT capital contrib.",
+  "eng_contrib"              = "Energy contrib.",
+  "lag(ln_lp, 1)"            = "ln(LP) t-1",
+  "log_employment_lag1"      = "Log emp. t-1"
+)
+rownames(cor_within) <- nice_names[rownames(cor_within)]
+colnames(cor_within) <- nice_names[colnames(cor_within)]
+
+# 2. Variance inflation factors via LSDV 
+if (!requireNamespace("car", quietly = TRUE)) install.packages("car")
+library(car)
+
+lsdv <- lm(
+  ln_lp ~ early_x_agg_x_intel_raw + mature_x_lm_x_intel_raw +
+          ict_capital_contrib + non_ict_capital_contrib + eng_contrib +
+          lag(ln_lp, 1) + log_employment_lag1 +
+          factor(bea_code) + factor(year),
+  data = panel_fp
+)
+
+vif_raw <- car::vif(lsdv)
+
+# Dropping the FE dummies from the VIF table
+keep <- c("early_x_agg_x_intel_raw", "mature_x_lm_x_intel_raw",
+          "ict_capital_contrib", "non_ict_capital_contrib", "eng_contrib",
+          "lag(ln_lp, 1)", "log_employment_lag1")
+vif_tab <- tibble::tibble(
+  Variable = unname(nice_names[keep]),
+  VIF      = round(unname(vif_raw[keep]), 2),
+  Verdict  = dplyr::case_when(
+    VIF < 5  ~ "Fine",
+    VIF < 10 ~ "Noteworthy",
+    TRUE     ~ "Problem"
+  )
+)
+
+kbl1 <- kable(round(cor_within, 3),
+              caption = "Within-transformed pairwise correlations of regressors in column (7)",
+              align   = "c") |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, position = "left") |>
+  row_spec(0, bold = TRUE)
+
+kbl2 <- kable(vif_tab,
+              caption = "Variance-inflation factors (LSDV equivalent)",
+              align   = c("l","r","l")) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, position = "left") |>
+  row_spec(0, bold = TRUE)
+
+print(kbl1); cat("\n\n"); print(kbl2)
+```
+
+# Period-dummy regression table
+
+$$
+\ln LP_{i,t} = \beta_1 \cdot \mathbf{1}[t \ge 2016]
+            + \beta_2 \cdot \mathbf{1}[t \ge 2016] \times \text{AIIE}_{i,t}^{\text{agg,raw}} \times \text{Intel}_t
+            + \boldsymbol{\gamma}'\mathbf{X}_{i,t} + \alpha_i + \delta_t + u_{i,t}
+$$
+# Period-dummy specification — Two-way FE with and without LP lag
+
+$$
+\ln LP_{i,t} = \beta_1 \cdot \mathbf{1}[t \ge 2016]
+            + \beta_2 \cdot \mathbf{1}[t \ge 2016] \times \text{AIIE}_{i,t}^{\text{agg,raw}} \times \text{Intel}_t
+            + \boldsymbol{\gamma}'\mathbf{X}_{i,t} + \alpha_i + \delta_t + u_{i,t}
+$$
+
+
+```{r build-period-panel}
+panel_pd <- panel_raw %>%
+  filter(industry != "Farms") %>%
+  arrange(bea_code, year) %>%
+  mutate(
+    ai_period               = as.integer(year >= 2016),
+    ai_period_x_agg_x_intel = ai_period * aggregate_raw_aiie * intelligence_index
+  )
+pdata_pd <- pdata.frame(panel_pd, index = c("bea_code", "year"))
+```
+
+```{r reg-table-period, results='asis'}
+# ── Formulas ──
+fml_pd <- ln_lp ~ ai_period + ai_period_x_agg_x_intel +
+                  ict_capital_contrib + non_ict_capital_contrib + eng_contrib
+
+fml_pd_lag <- ln_lp ~ ai_period + ai_period_x_agg_x_intel +
+                       ict_capital_contrib + non_ict_capital_contrib + eng_contrib +
+                       lag(ln_lp, 1)
+
+# ── Two specifications ──
+m_2we_pd     <- plm(fml_pd,     data = pdata_pd, model = "within", effect = "twoways")
+m_2we_pd_lag <- plm(fml_pd_lag, data = pdata_pd, model = "within", effect = "twoways")
+
+vcov_pd <- list(
+  "Two-way FE" = clse(m_2we_pd),
+  "+ LP lag"   = clse(m_2we_pd_lag)
+)
+
+mods_pd <- list(
+  "Two-way FE" = m_2we_pd,
+  "+ LP lag"   = m_2we_pd_lag
+)
+
+coef_map_pd <- c(
+  "ai_period"                = "AI period $\\mathbf{1}[t \\ge 2016]$",
+  "ai_period_x_agg_x_intel"  = "AI period × Aggregate AIIE × Intel",
+  "ict_capital_contrib"      = "ICT-capital contribution",
+  "non_ict_capital_contrib"  = "Non-ICT capital contribution",
+  "eng_contrib"              = "Energy contribution",
+  "lag(ln_lp, 1)"            = "ln(LP) $_{t-1}$",
+  "(Intercept)"              = "Constant"
+)
+
+gof_pd <- tibble::tribble(
+  ~raw,            ~clean,            ~fmt,
+  "nobs",          "Observations",    0,
+  "r.squared",     "R²",              3,
+  "adj.r.squared", "Adj. R²",         3
+)
+
+add_rows_pd <- tibble::tribble(
+  ~term,                       ~`Two-way FE`, ~`+ LP lag`,
+  "Industry fixed effects",    "Yes",         "Yes",
+  "Year fixed effects",        "Yes",         "Yes",
+  "AI dummy absorbed by FE?",  "Yes",         "Yes",
+  "Sample years",              "1997–2024",   "1998–2024",
+  "SE cluster",                "Industry",    "Industry"
+)
+attr(add_rows_pd, "position") <- NULL
+
+raw_pd <- modelsummary(
+  mods_pd,
+  vcov         = vcov_pd,
+  coef_map     = coef_map_pd,
+  gof_map      = gof_pd,
+  add_rows     = add_rows_pd,
+  stars        = c('*' = .1, '**' = .05, '***' = .01),
+  title        = "Period-dummy specification — full panel (1997–2024)",
+  notes        = c(
+    "Dependent variable: ln(LP) — log of the BLS labor productivity index.",
+    "AI period dummy = 1 if year ≥ 2016, 0 otherwise.",
+    "The AI period dummy is purely time-varying and is therefore mechanically absorbed by year FE; both cells appear blank by construction.",
+    "The triple interaction (AI period × Aggregate AIIE × Intel) is mechanically zero before 2016 — coefficient identified from 2016+ within-industry variation.",
+    "Column (2) adds ln(LP)_{t-1}; first-year observations drop because of the lag.",
+    "Standard errors clustered at the industry level (HC1)."
+  ),
+  output = "kableExtra"
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                position = "center") %>%
+  row_spec(0, bold = TRUE) %>%
+  add_header_above(c(" " = 1, "(1)" = 1, "(2)" = 1)) %>%
+  as.character()
+
+raw_pd <- gsub("&amp;nbsp;", "", raw_pd, fixed = TRUE)
+raw_pd <- gsub("&nbsp;",     "", raw_pd, fixed = TRUE)
+raw_pd <- gsub("\u00A0",     "", raw_pd, fixed = TRUE)
+
+htmltools::HTML(raw_pd)
+```
+
+
+```{r vif-table, results='asis'}
+library(car)
+
+# Computing VIFs from the LSDV equivalent of the column (7) two-way FE model
+vif_raw <- vif(lm(
+  ln_lp ~ early_x_agg_x_intel_raw + mature_x_lm_x_intel_raw +
+          ict_capital_contrib + non_ict_capital_contrib + eng_contrib +
+          lag(ln_lp, 1) + log_employment_lag1 +
+          factor(bea_code) + factor(year),
+  data = panel_fp
+))
+
+nice_names <- c(
+  "early_x_agg_x_intel_raw"  = "Early × Aggregate AIIE × Intel",
+  "mature_x_lm_x_intel_raw"  = "Mature × LM AIIE × Intel",
+  "ict_capital_contrib"      = "ICT-capital contribution",
+  "non_ict_capital_contrib"  = "Non-ICT capital contribution",
+  "eng_contrib"              = "Energy contribution",
+  "lag(ln_lp, 1)"            = "ln(LP) t-1",
+  "log_employment_lag1"      = "Log employment t-1",
+  "factor(bea_code)"         = "Industry fixed effects",
+  "factor(year)"             = "Year fixed effects"
+)
+
+vif_tab <- tibble::tibble(
+  Variable = nice_names[rownames(vif_raw)],
+  GVIF     = round(vif_raw[, "GVIF"], 3),
+  Df       = vif_raw[, "Df"],
+  `GVIF^(1/(2·Df))` = round(vif_raw[, "GVIF^(1/(2*Df))"], 3),
+  Verdict = dplyr::case_when(
+    vif_raw[, "GVIF^(1/(2*Df))"] < sqrt(5)  ~ "No problem",
+    vif_raw[, "GVIF^(1/(2*Df))"] < sqrt(10) ~ "Noteworthy",
+    TRUE                                     ~ "Problem - do not include with final model"
+  )
+)
+
+kable(vif_tab,
+      caption = "Variance-inflation factors for the two-way FE model with both lags",
+      align   = c("l","r","r","r","l")) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, position = "left") |>
+  row_spec(0, bold = TRUE) |>
+  footnote(general = c(
+    "Threshold rules of thumb (on the GVIF^(1/(2·Df)) scale): < 2.24 = fine, 2.24–3.16 = noteworthy, > 3.16 = redundant.",
+    "Industry FE has a large raw GVIF by construction (59 levels); the scaled column is what's comparable across rows.",
+    "Log employment t-1 is flagged as redundant with the industry fixed effects, not with the other regressors."
+  ),
+  general_title = "Notes:", footnote_as_chunk = FALSE)
+```
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(ggrepel)
+
+# Working sample:
+panel_plot <- panel_raw %>%
+  filter(industry != "Farms", !is.na(lp_index))
+
+# COVID shading (2020–2021)
+covid_band <- data.frame(xmin = 2020, xmax = 2021)
+
+# Cross-industry summary of raw lp_index by year
+yearly_raw <- panel_plot %>%
+  group_by(year) %>%
+  summarise(
+    mean_lp = mean(lp_index, na.rm = TRUE),
+    p25     = quantile(lp_index, 0.25, na.rm = TRUE),
+    p75     = quantile(lp_index, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+p_raw <- ggplot() +
+  geom_rect(data = covid_band,
+            aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf),
+            fill = "grey75", alpha = 0.45, inherit.aes = FALSE) +
+  annotate("text", x = 2020.5,
+           y = max(panel_plot$lp_index, na.rm = TRUE) * 0.97,
+           label = "COVID", color = "grey30", size = 3.2, fontface = "italic") +
+  geom_line(data = panel_plot,
+            aes(x = year, y = lp_index, group = bea_code),
+            color = "steelblue", alpha = 0.18, linewidth = 0.4) +
+  geom_ribbon(data = yearly_raw, aes(x = year, ymin = p25, ymax = p75),
+              fill = "navy", alpha = 0.18) +
+  geom_line(data = yearly_raw, aes(x = year, y = mean_lp),
+            color = "navy", linewidth = 1.1) +
+  scale_x_continuous(breaks = seq(min(panel_plot$year),
+                                  max(panel_plot$year), by = 4)) +
+  labs(
+    title    = "Labor productivity index over time",
+    subtitle = "Light lines: individual industries · bold line: cross-industry mean · ribbon: 25–75th percentile",
+    x = "Year", y = "lp_index (2017 = 100)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title       = element_text(face = "bold"))
+
+print(p_raw)
+```
+
+
+```{r}
+# Within-industry Z-score
+panel_z <- panel_plot %>%
+  group_by(bea_code) %>%
+  mutate(lp_z = (lp_index - mean(lp_index, na.rm = TRUE)) /
+                  sd(lp_index, na.rm = TRUE)) %>%
+  ungroup()
+
+yearly_z <- panel_z %>%
+  group_by(year) %>%
+  summarise(
+    mean_z = mean(lp_z, na.rm = TRUE),
+    p25    = quantile(lp_z, 0.25, na.rm = TRUE),
+    p75    = quantile(lp_z, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+p_z <- ggplot() +
+  geom_rect(data = covid_band,
+            aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf),
+            fill = "grey75", alpha = 0.45, inherit.aes = FALSE) +
+  annotate("text", x = 2020.5,
+           y = max(panel_z$lp_z, na.rm = TRUE) * 0.92,
+           label = "COVID", color = "grey30", size = 3.2, fontface = "italic") +
+  geom_hline(yintercept = 0, color = "grey50", linetype = "dashed") +
+  geom_line(data = panel_z,
+            aes(x = year, y = lp_z, group = bea_code),
+            color = "firebrick", alpha = 0.18, linewidth = 0.4) +
+  geom_ribbon(data = yearly_z, aes(x = year, ymin = p25, ymax = p75),
+              fill = "darkred", alpha = 0.18) +
+  geom_line(data = yearly_z, aes(x = year, y = mean_z),
+            color = "darkred", linewidth = 1.1) +
+  scale_x_continuous(breaks = seq(min(panel_z$year),
+                                  max(panel_z$year), by = 4)) +
+  labs(
+    title    = "Labor productivity (within-industry Z-score) over time",
+    subtitle = "Each industry standardised against its own history · 0 = industry's own mean",
+    x = "Year", y = "lp_index Z-score (within industry)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title       = element_text(face = "bold"))
+
+print(p_z)
+```
+
+```{r}
+# ── Knobs (tune to taste) ───────────────────────────────────────
+resid_threshold <- 1.5    
+extreme_pctile  <- 0.02  
+
+
+panel_2020 <- panel_raw %>%
+  filter(industry != "Farms", year == 2020,
+         !is.na(wfh_index), !is.na(lp_index))
+
+# OLS fit → standardised residuals (= residual / SE), so the threshold is
+# unitless and roughly comparable to a z-score
+fit_2020 <- lm(lp_index ~ wfh_index, data = panel_2020)
+
+panel_2020 <- panel_2020 %>%
+  mutate(
+    std_resid = rstandard(fit_2020),
+    is_label  = abs(std_resid) > resid_threshold |
+                wfh_index >= quantile(wfh_index, 1 - extreme_pctile) |
+                wfh_index <= quantile(wfh_index,     extreme_pctile) |
+                lp_index  >= quantile(lp_index,  1 - extreme_pctile) |
+                lp_index  <= quantile(lp_index,      extreme_pctile)
+  )
+
+cor_2020 <- cor(panel_2020$wfh_index, panel_2020$lp_index)
+
+p_scatter <- ggplot(panel_2020, aes(x = wfh_index, y = lp_index)) +
+  geom_smooth(method = "lm", se = TRUE,
+              color = "steelblue", fill = "steelblue", alpha = 0.15) +
+  geom_point(aes(color = is_label), size = 2.6, alpha = 0.85) +
+  geom_text_repel(
+    data = filter(panel_2020, is_label),
+    aes(label = industry, color = is_label),
+    size = 3, max.overlaps = Inf,
+    segment.color = "grey55", segment.alpha = 0.6,
+    box.padding = 0.45, min.segment.length = 0,
+    show.legend = FALSE
+  ) +
+  scale_color_manual(values = c(`TRUE` = "firebrick", `FALSE` = "steelblue"),
+                     guide = "none") +
+  labs(
+    title    = "Work-from-home capacity vs labor productivity, 2020",
+    subtitle = sprintf(
+      "Pearson r = %.3f · Labelled (red): |std. resid.| > %g or top/bottom %g%% on either axis",
+      cor_2020, resid_threshold, extreme_pctile * 100),
+    x = "WFH index (industry-level WFH feasibility)",
+    y = "lp_index (2017 = 100)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title       = element_text(face = "bold"))
+
+print(p_scatter)
+```
+
+
+
+# Additional Specification Tests
+
+
+## Panel unit root test
+
+```{r unit-root}
+library(plm)
+library(kableExtra)
+
+# Im-Pesaran-Shin panel unit root test on ln(LP)
+
+ips_trend <- purtest(pdata$ln_lp, test = "ips", exo = "trend",
+                     lags = "AIC", pmax = 2)
+
+ips_const <- purtest(pdata$ln_lp, test = "ips", exo = "intercept",
+                     lags = "AIC", pmax = 2)
+
+ips_fd    <- purtest(diff(pdata$ln_lp), test = "ips", exo = "intercept",
+                     lags = "AIC", pmax = 2)
+
+ur_table <- tibble::tibble(
+  Series      = c("ln(LP) — with trend",
+                  "ln(LP) — with intercept only",
+                  "Δln(LP) — first difference"),
+  `W-bar stat` = c(
+    round(ips_trend$statistic$statistic,  3),
+    round(ips_const$statistic$statistic,  3),
+    round(ips_fd$statistic$statistic,     3)
+  ),
+  `p-value` = c(
+    formatC(ips_trend$statistic$p.value, digits = 4, format = "g"),
+    formatC(ips_const$statistic$p.value, digits = 4, format = "g"),
+    formatC(ips_fd$statistic$p.value,    digits = 4, format = "g")
+  ),
+  Decision = c(
+    ifelse(ips_trend$statistic$p.value < 0.05,
+           "Reject H0 — stationary", "Fail to reject — unit root"),
+    ifelse(ips_const$statistic$p.value < 0.05,
+           "Reject H0 — stationary", "Fail to reject — unit root"),
+    ifelse(ips_fd$statistic$p.value    < 0.05,
+           "Reject H0 — stationary", "Fail to reject — unit root")
+  ),
+  Implication = c(
+    "Levels regression is valid",
+    "Levels regression is valid",
+    "ln(LP) is I(1); first-differences spec preferred"
+  )
+)
+
+kable(ur_table,
+      caption = "Im-Pesaran-Shin panel unit root tests",
+      align   = c("l","r","r","l","l")) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, position = "left") |>
+  row_spec(0, bold = TRUE) |>
+  footnote(
+    general = c(
+      "H0: all panels contain a unit root (IPS test).",
+      "Lag length selected by AIC, maximum 2 lags.",
+      "If ln(LP) has a unit root but Δln(LP) does not, the series is I(1).",
+      "In that case the first-differences estimator is preferred over the levels FE.",
+      "Rejection for Δln(LP) confirms it is stationary regardless of the levels result."
+    ),
+    general_title = "Notes:"
+  )
+```
+
+
+## Pre-trend test (parallel trends)
+
+```{r pre-trend-setup}
+
+panel_es <- panel_raw %>%
+  filter(industry != "Farms") %>%
+  arrange(bea_code, year) %>%
+  group_by(bea_code) %>%
+  mutate(
+    aiie_fixed = max(aggregate_raw_aiie, na.rm = TRUE),
+    aiie_fixed = ifelse(is.infinite(aiie_fixed), NA_real_, aiie_fixed)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(aiie_fixed))
+
+years_to_interact <- sort(setdiff(unique(panel_es$year), 2015))
+
+for (yr in years_to_interact) {
+  panel_es[[paste0("aiie_x_y", yr)]] <-
+    as.integer(panel_es$year == yr) * panel_es$aiie_fixed
+}
+
+# Estimating the event-study model with two-way FE
+es_terms   <- paste0("aiie_x_y", years_to_interact, collapse = " + ")
+es_formula <- as.formula(paste0(
+  "ln_lp ~ ", es_terms,
+  " + ict_capital_contrib + non_ict_capital_contrib + eng_contrib",
+  " + factor(bea_code) + factor(year)"
+))
+
+es_fit <- lm(es_formula, data = panel_es)
+es_vcov <- sandwich::vcovCL(es_fit,
+                            cluster = panel_es[["bea_code"]])
+```
+
+```{r pre-trend-plot}
+library(ggplot2)
+
+# Extracting coefficients and clustered SEs for each year interaction
+es_rows <- paste0("aiie_x_y", years_to_interact)
+present  <- intersect(es_rows, rownames(lmtest::coeftest(es_fit, vcov = es_vcov)))
+
+es_coefs <- tibble::tibble(
+  year  = as.integer(gsub("aiie_x_y", "", present)),
+  coef  = lmtest::coeftest(es_fit, vcov = es_vcov)[present, "Estimate"],
+  se    = lmtest::coeftest(es_fit, vcov = es_vcov)[present, "Std. Error"]
+) %>%
+  dplyr::mutate(lo = coef - 1.96 * se, hi = coef + 1.96 * se) %>%
+  dplyr::bind_rows(
+    tibble::tibble(year = 2015L, coef = 0, se = 0, lo = 0, hi = 0)
+  ) %>%
+  dplyr::arrange(year)
+
+ggplot(es_coefs, aes(x = year, y = coef)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_vline(xintercept = 2015.5, linetype = "dotted", colour = "red",
+             linewidth = 0.8) +
+  geom_errorbar(aes(ymin = lo, ymax = hi),
+                width = 0.3, colour = "steelblue") +
+  geom_point(size = 2.5, colour = "navy") +
+  annotate("text", x = 2013, y = max(es_coefs$hi, na.rm = TRUE) * 0.9,
+           label = "Pre-period\n(should be ≈ 0)", colour = "grey30",
+           size = 3) +
+  annotate("text", x = 2020, y = max(es_coefs$hi, na.rm = TRUE) * 0.9,
+           label = "Post-2015\n(AI era)", colour = "grey30", size = 3) +
+  scale_x_continuous(breaks = seq(1998, 2024, 2)) +
+  labs(
+    title    = "Event study: productivity response to AI exposure",
+    subtitle = "AIIE × year dummy | 2015 = reference year | 95% CI clustered by industry",
+    x = "Year", y = "Estimated effect on ln(LP)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor  = element_blank(),
+        plot.title        = element_text(face = "bold"))
+```
+
+```{r pre-trend-ftest}
+# Joint F-test
+
+pre_terms <- paste0("aiie_x_y", years_to_interact[years_to_interact < 2016])
+
+pre_trend_test <- car::linearHypothesis(
+  es_fit,
+  paste0(pre_terms, " = 0"),
+  vcov. = es_vcov,
+  test  = "F"
+)
+
+pt_table <- tibble::tibble(
+  Hypothesis  = "All pre-2016 AIIE × year = 0",
+  `F-stat`    = round(pre_trend_test$F[2], 3),
+  df1         = pre_trend_test$Df[2],
+  df2         = pre_trend_test$Res.Df[2],
+  `p-value`   = formatC(pre_trend_test$`Pr(>F)`[2], digits = 4, format = "g"),
+  Decision    = ifelse(
+    pre_trend_test$`Pr(>F)`[2] < 0.05,
+    "Reject H0 — pre-trends differ (identification concern)",
+    "Fail to reject — parallel trends holds"
+  )
+)
+
+kable(pt_table,
+      caption = "Pre-trend F-test: joint significance of pre-2016 AIIE × year coefficients",
+      align   = c("l","r","r","r","r","l")) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, position = "left") |>
+  row_spec(0, bold = TRUE) |>
+  footnote(
+    general = c(
+      "H0: all pre-2016 AIIE × year interaction coefficients equal zero simultaneously.",
+      "Reference year: 2015. Standard errors clustered at the industry level.",
+      "Failure to reject supports the parallel-trends assumption underlying the",
+      "difference-in-differences identification strategy."
+    ),
+    general_title = "Notes:"
+  )
+```
+
+
+## System GMM (dynamic panel)
+
+```{r gmm-estimate}
+library(plm)
+
+# System GMM formula syntax in pgmm()
+m_gmm <- pgmm(
+  ln_lp ~ lag(ln_lp, 1) +
+          early_x_agg_x_intel_raw + mature_x_lm_x_intel_raw +
+          ict_capital_contrib + non_ict_capital_contrib + eng_contrib +
+          log_employment_lag1
+  | lag(ln_lp, 2:3)
+  | early_x_agg_x_intel_raw + mature_x_lm_x_intel_raw +
+    ict_capital_contrib + non_ict_capital_contrib +
+    eng_contrib + log_employment_lag1,
+  data           = pdata,
+  effect         = "twoways",
+  model          = "twosteps",
+  transformation = "ld"
+)
+
+cat("=== SYSTEM GMM (Blundell-Bond) ===\n")
+print(summary(m_gmm, robust = TRUE))
+
+
+n_instr  <- length(unlist(m_gmm$instruments))
+n_groups <- n_distinct(panel$bea_code)
+cat("\nInstruments:", n_instr, "| Groups:", n_groups)
+if (n_instr > n_groups) {
+  cat(" — WARNING: too many instruments; reduce to lag(ln_lp, 2:3)\n")
+} else {
+  cat(" — OK\n")
+}
+```
+
+```{r gmm-validity-tests}
+# Arellano-Bond tests via explicit residual autocorrelation.
+
+
+# Sargan-Hansen overidentification test
+sargan_test <- sargan(m_gmm)
+
+# Manual AR(1) test on GMM residuals
+gmm_resid_vec <- unlist(residuals(m_gmm))
+
+gmm_index <- pdata %>%
+  as.data.frame() %>%
+  select(bea_code, year) %>%
+  arrange(bea_code, year) %>%
+  group_by(bea_code) %>%
+  slice(-1) %>%
+  ungroup()
+
+if (length(gmm_resid_vec) != nrow(gmm_index)) {
+  gmm_index <- data.frame(
+    bea_code = gsub("-.*", "", names(gmm_resid_vec)),
+    year     = as.integer(gsub(".*-", "", names(gmm_resid_vec)))
+  )
+}
+
+resid_df <- gmm_index %>%
+  mutate(resid = gmm_resid_vec) %>%
+  arrange(bea_code, year) %>%
+  group_by(bea_code) %>%
+  mutate(resid_lag1 = lag(resid, 1)) %>%
+  ungroup() %>%
+  filter(!is.na(resid_lag1))
+
+ar1_fit  <- lm(resid ~ resid_lag1, data = resid_df)
+ar1_test <- lmtest::coeftest(ar1_fit,
+             vcov = sandwich::vcovCL(ar1_fit,
+                    cluster = resid_df$bea_code))
+p_ar1    <- ar1_test[2, 4]
+stat_ar1 <- ar1_test[2, 3]
+
+
+ab_table <- tibble::tibble(
+  Test      = c("AR(1) in residuals",
+                "AR(2) in residuals",
+                "Sargan-Hansen J-test"),
+  Statistic = c(round(stat_ar1, 3),
+                "—",
+                round(sargan_test$statistic, 3)),
+  `p-value` = c(formatC(p_ar1, digits = 4, format = "g"),
+                "not feasible",
+                formatC(sargan_test$p.value, digits = 4, format = "g")),
+  Required  = c("p < 0.05", "p > 0.05", "p > 0.05"),
+  Decision  = c(
+    ifelse(p_ar1 < 0.05,
+           "Pass — serial correlation present (expected)",
+           "Unexpected — check model"),
+    "Aliased out — perfect MA(1) in GMM residuals (see note)",
+    ifelse(sargan_test$p.value > 0.05,
+           "Pass — instruments valid",
+           "Reject — instruments may be invalid")
+  )
+)
+
+kable(ab_table,
+      caption = "GMM validity tests — AR and overidentification",
+      align   = c("l","r","r","r","l")) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, position = "left") |>
+  row_spec(0, bold = TRUE) |>
+  footnote(
+    general = c(
+      "AR(1): serial correlation in GMM residuals is expected and not a problem.",
+      "AR(2): not feasible — System GMM differencing induces perfect MA(1) structure",
+      "       in the residuals (resid_lag1 coefficient = 1.0 exactly), causing",
+      "       resid_lag2 to be aliased out of the AR(2) regression.",
+      "       Instrument validity is instead assessed via the Sargan-Hansen test.",
+      "Sargan-Hansen: H0 is that all instruments are uncorrelated with the error term.",
+      "Note: Sargan test loses power when instrument count approaches group count (59)."
+    ),
+    general_title = "Notes:"
+  )
+
+
+p_ar2 <- NA_real_
+```
+
+```{r gmm-long-run}
+# Short-run and long-run AI effects 
+
+coefs_gmm <- coef(m_gmm)
+rho       <- coefs_gmm["lag(ln_lp, 1)"]
+rho_fe    <- coef(m_2weNEW)["lag(ln_lp, 1)"]
+
+cat("=== PERSISTENCE COEFFICIENT ===\n")
+cat("rho (GMM):", round(rho,    4), "\n")
+cat("rho (FE): ", round(rho_fe, 4),
+    " — expect FE < GMM due to Nickell bias\n")
+cat("Long-run multiplier: 1 / (1 -", round(rho, 2), ") =",
+    round(1 / (1 - rho), 2), "\n")
+
+if (rho >= 1) cat("WARNING: rho >= 1 implies unit root\n")
+if (rho <= 0) cat("WARNING: rho <= 0 is economically implausible\n")
+
+# Long-run effects table
+ai_terms <- c("early_x_agg_x_intel_raw", "mature_x_lm_x_intel_raw")
+ai_labels <- c("Early × Aggregate AIIE × Intel",
+               "Mature × LM AIIE × Intel")
+
+lr_table <- tibble::tibble(
+  Term            = ai_labels,
+  `SR (GMM)`      = round(coefs_gmm[ai_terms], 4),
+  `LR (GMM)`      = round(coefs_gmm[ai_terms] / (1 - rho), 4),
+  `SR (FE)`       = round(coef(m_2weNEW)[ai_terms], 4),
+  `LR multiplier` = round(1 / (1 - rho), 2)
+)
+
+kable(lr_table,
+      caption = "System GMM: short-run and long-run AI effects",
+      align   = c("l","r","r","r","r")) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, position = "left") |>
+  row_spec(0, bold = TRUE) |>
+  footnote(
+    general = c(
+      "SR = short-run (one-period) coefficient from System GMM.",
+      "LR = long-run effect = SR / (1 - rho); cumulative effect once full adjustment plays out.",
+      "FE SR shown for comparison — Nickell bias pushes rho downward in FE.",
+      "Similar SR coefficients between FE and GMM indicate Nickell bias is not driving results."
+    ),
+    general_title = "Notes:"
+  )
+```
+
+---
+
+## Skill heterogeneity: does the AI effect differ by workforce education?
+
+```{r skill-heterogeneity}
+library(car)
+
+# Compute median college share across the working panel
+# Use the time-average per industry so the split is stable
+median_college <- panel %>%
+  group_by(bea_code) %>%
+  summarise(avg_college = mean(college_share, na.rm = TRUE),
+            .groups = "drop") %>%
+  summarise(med = median(avg_college, na.rm = TRUE)) %>%
+  pull(med)
+
+cat("Median college share (time-averaged):", round(median_college, 3), "\n")
+
+# Add skill group and interaction terms to the working panel
+panel_skill <- panel %>%
+  group_by(bea_code) %>%
+  mutate(avg_college = mean(college_share, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(
+    # high_skill = 1 if the industry's average college share is above median
+    high_skill = as.integer(avg_college >= median_college),
+
+    # Interacted mature AI term — key coefficient of interest
+    # H2: beta on mature_lm_highskill > beta on mature_lm_lowskill
+    mature_lm_highskill = mature_x_lm_x_intel_raw * high_skill,
+    mature_lm_lowskill  = mature_x_lm_x_intel_raw * (1 - high_skill),
+
+    # Early AI term split (for completeness)
+    early_agg_highskill = early_x_agg_x_intel_raw * high_skill,
+    early_agg_lowskill  = early_x_agg_x_intel_raw * (1 - high_skill)
+  )
+
+pdata_skill <- pdata.frame(panel_skill, index = c("bea_code", "year"))
+
+# Heterogeneous-effect model:
+# The focal AI terms are replaced by their skill-split versions.
+# This lets the early and mature AI effects differ between
+# high-skill and low-skill industries.
+m_skill <- plm(
+  ln_lp ~ early_agg_highskill + early_agg_lowskill +
+          mature_lm_highskill + mature_lm_lowskill +
+          ict_capital_contrib + non_ict_capital_contrib + eng_contrib +
+          log_employment_lag1,
+  data   = pdata_skill,
+  model  = "within",
+  effect = "twoways"
+)
+
+# Print with clustered SEs
+ct_print(m_skill, "Two-way FE — skill heterogeneity split")
+
+# Formal test: is mature AI effect significantly different across skill groups?
+# H0: mature_lm_highskill = mature_lm_lowskill
+# Rejection supports H2: AI is more labor-augmenting in high-skill industries
+skill_wald <- car::linearHypothesis(
+  m_skill,
+  "mature_lm_highskill = mature_lm_lowskill",
+  vcov. = clse(m_skill),
+  test  = "Chisq"
+)
+
+skill_table <- tibble::tibble(
+  Coefficient        = c("Mature AI — high skill industries",
+                         "Mature AI — low skill industries",
+                         "Difference (high − low)"),
+  Estimate           = c(
+    round(coef(m_skill)["mature_lm_highskill"], 4),
+    round(coef(m_skill)["mature_lm_lowskill"],  4),
+    round(coef(m_skill)["mature_lm_highskill"] -
+          coef(m_skill)["mature_lm_lowskill"],  4)
+  ),
+  `SE (clustered)`   = c(
+    round(sqrt(clse(m_skill)["mature_lm_highskill",
+                              "mature_lm_highskill"]), 4),
+    round(sqrt(clse(m_skill)["mature_lm_lowskill",
+                              "mature_lm_lowskill"]),  4),
+    NA_real_
+  ),
+  Note = c(
+    "Above-median college share industries",
+    "Below-median college share industries",
+    sprintf("Wald Chi2 = %.3f, p = %s",
+            skill_wald$Chisq[2],
+            formatC(skill_wald$`Pr(>Chisq)`[2], digits = 4, format = "g"))
+  )
+)
+
+kable(skill_table,
+      caption = "Skill heterogeneity: mature AI effect by workforce education",
+      align   = c("l","r","r","l")) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, position = "left") |>
+  row_spec(3, bold = TRUE) |>
+  row_spec(0, bold = TRUE) |>
+  footnote(
+    general = c(
+      "High-skill: industries with above-median time-averaged college share.",
+      "Low-skill: industries with below-median time-averaged college share.",
+      paste0("Median college share used for split: ",
+             round(median_college, 3), "."),
+      "Wald test H0: mature AI coefficient is equal across skill groups.",
+      "Rejection supports H2: AI augmentation is stronger in high-skill industries."
+    ),
+    general_title = "Notes:"
+  )
+```
+
+---
+
+## Summary of all specification tests
+
+```{r test-summary}
+
+p_ips_trend <- ips_trend$statistic$p.value
+p_ips_const <- ips_const$statistic$p.value
+p_pretrend  <- pre_trend_test$`Pr(>F)`[2]
+p_skill     <- skill_wald$`Pr(>Chisq)`[2]
+
+
+p_ife_vs_pool <- as.numeric(pFtest(m_ife, m_pool)$p.value)
+p_tfe_vs_pool <- as.numeric(pFtest(m_tfe, m_pool)$p.value)
+p_2we_vs_pool <- as.numeric(pFtest(m_2we, m_pool)$p.value)
+p_serial      <- as.numeric(pbgtest(m_2we)$p.value)
+p_csd_obj     <- try(pcdtest(m_2we, test = "cd"), silent = TRUE)
+p_csd         <- if (!inherits(p_csd_obj, "try-error"))
+                   as.numeric(p_csd_obj$p.value) else NA_real_
+
+master <- tibble::tibble(
+  Section    = c(
+    rep("Fixed Effects", 3),
+    "Serial Correlation",
+    "Cross-Sectional Dependence",
+    rep("Unit Root", 2),
+    "Pre-Trend",
+    rep("GMM Validity", 2),
+    "Skill Heterogeneity"
+  ),
+  Test       = c(
+    "Industry FE vs Pooled OLS",
+    "Year FE vs Pooled OLS",
+    "Two-way FE vs Pooled OLS",
+    "Breusch-Godfrey / Wooldridge AR(1)",
+    "Pesaran CD",
+    "IPS unit root — ln(LP) with trend",
+    "IPS unit root — ln(LP) with intercept",
+    "Pre-trend joint F-test (pre-2016)",
+    "Arellano-Bond AR(1)",
+    "Arellano-Bond AR(2)",
+    "Mature AI: high-skill = low-skill"
+  ),
+  H0         = c(
+    "No industry effects",
+    "No time effects",
+    "No two-way effects",
+    "No AR(1) serial correlation",
+    "Cross-sectional independence",
+    "Unit root in ln(LP)",
+    "Unit root in ln(LP)",
+    "Parallel pre-trends hold",
+    "No AR(1) in differences",
+    "No AR(2) in differences",
+    "Skill groups have equal AI effect"
+  ),
+  `p-value`  = c(
+    formatC(p_ife_vs_pool, digits = 4, format = "g"),
+    formatC(p_tfe_vs_pool, digits = 4, format = "g"),
+    formatC(p_2we_vs_pool, digits = 4, format = "g"),
+    formatC(p_serial,      digits = 4, format = "g"),
+    ifelse(is.na(p_csd), "—",
+           formatC(p_csd, digits = 4, format = "g")),
+    formatC(p_ips_trend,   digits = 4, format = "g"),
+    formatC(p_ips_const,   digits = 4, format = "g"),
+    formatC(p_pretrend,    digits = 4, format = "g"),
+  ifelse(is.na(p_ar2), "—", formatC(p_ar2, digits = 4, format = "g")),
+    ifelse(is.na(p_ar2), "—", formatC(p_ar2, digits = 4, format = "g")),
+    formatC(p_skill,       digits = 4, format = "g")
+  ),
+  Decision   = c(
+    ifelse(p_ife_vs_pool < 0.05, "Reject H0", "Fail to reject"),
+    ifelse(p_tfe_vs_pool < 0.05, "Reject H0", "Fail to reject"),
+    ifelse(p_2we_vs_pool < 0.05, "Reject H0", "Fail to reject"),
+    ifelse(p_serial      < 0.05, "Reject H0", "Fail to reject"),
+    ifelse(is.na(p_csd), "—",
+           ifelse(p_csd < 0.05, "Reject H0", "Fail to reject")),
+    ifelse(p_ips_trend   < 0.05, "Reject H0", "Fail to reject"),
+    ifelse(p_ips_const   < 0.05, "Reject H0", "Fail to reject"),
+    ifelse(p_pretrend    < 0.05, "Reject H0 (concern)", "Fail to reject"),
+    ifelse(p_ar1         < 0.05, "Reject H0 (expected)", "Unexpected"),
+   ifelse(is.na(p_ar2),
+       "Not feasible — see GMM notes",
+       ifelse(p_ar2 > 0.05,
+              "Fail to reject (pass)",
+              "Reject H0 (fail)")),
+    ifelse(p_skill       < 0.05, "Reject H0 (heterogeneity)", "Fail to reject")
+  )
+)
+
+kable(master,
+      caption = "Master summary of all specification tests",
+      align   = c("l","l","l","r","l")) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, position = "left") |>
+  row_spec(0, bold = TRUE) |>
+  pack_rows("Fixed Effects Justification", 1, 3) |>
+  pack_rows("Serial Correlation",          4, 4) |>
+  pack_rows("Cross-Sectional Dependence",  5, 5) |>
+  pack_rows("Unit Root",                   6, 7) |>
+  pack_rows("Pre-Trend / Parallel Trends", 8, 8) |>
+  pack_rows("GMM Validity",                9, 10) |>
+  pack_rows("Skill Heterogeneity (H2)",   11, 11) |>
+  footnote(
+    general = c(
+      "All FE and serial correlation tests use the preferred two-way FE model (m_2we).",
+      "Pre-trend test: H0 is that all pre-2016 AIIE × year coefficients equal zero.",
+      "AR(1) rejection is expected and does not indicate a problem.",
+      "AR(2) non-rejection is required for GMM instrument validity.",
+      "Skill split uses median time-averaged college share as the threshold."
+    ),
+    general_title = "Notes:"
+  )
+```

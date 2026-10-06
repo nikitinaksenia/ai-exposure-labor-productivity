@@ -1,0 +1,183 @@
+---
+title: "Build employment panel"
+date: "2026-04-25"
+output: pdf_document
+---
+
+```{r}
+
+# Stack BLS OES / OEWS National Industry-Specific 4-digit NAICS employment
+# files for 2016-2024 into a single panel-ready CSV for AIIE construction.
+
+library(tidyverse)
+library(readxl)
+
+oes_folder <- "../Data/Source data/Employment source files"
+
+employment_csv <- "../Data/Intermediate data/oes_panel_2016_2024.csv"
+
+clean_names <- function(df) {
+  names(df) <- names(df) %>%
+    str_to_lower() %>%
+    str_replace_all("[^a-z0-9]+", "_") %>%
+    str_replace_all("^_|_$", "")
+  df
+}
+
+pick_col <- function(df, candidates) {
+  hit <- intersect(candidates, names(df))
+  if (length(hit) == 0) NA_character_ else hit[1]
+}
+
+get_year <- function(fname) {
+
+  m <- str_extract(fname, "20(1[6-9]|2[0-4])")
+  if (!is.na(m)) return(as.integer(m))
+
+  m2 <- str_extract(fname, "(?i)(?<=m)(1[6-9]|2[0-4])(?=[^0-9]|$)")
+  if (!is.na(m2)) return(as.integer(paste0("20", m2)))
+  NA_integer_
+}
+
+
+# Read one OES file 
+read_one_oes <- function(path) {
+  ext <- tools::file_ext(path) %>% str_to_lower()
+  na_strings <- c("", "NA", "**", "*", "#", "***", "*****")
+
+  raw <- switch(
+    ext,
+    "xlsx" = read_excel(path, sheet = 1, na = na_strings, guess_max = 100000),
+    "xls"  = read_excel(path, sheet = 1, na = na_strings, guess_max = 100000),
+    "csv"  = read_csv(path, na = na_strings, show_col_types = FALSE),
+    stop("Unsupported file extension: ", ext)
+  )
+
+  df <- clean_names(raw)
+
+
+  occ_code_col    <- pick_col(df, c("occ_code", "occcode"))
+  occ_title_col   <- pick_col(df, c("occ_title", "occtitle"))
+  naics_col       <- pick_col(df, c("naics"))
+  naics_title_col <- pick_col(df, c("naics_title", "industry_title", "naicstitle"))
+  o_group_col     <- pick_col(df, c("o_group", "occ_group", "group"))
+  i_group_col     <- pick_col(df, c("i_group", "naics_group"))
+  tot_emp_col     <- pick_col(df, c("tot_emp", "totemp"))
+
+
+  required <- c(occ_code_col, naics_col, tot_emp_col)
+  if (any(is.na(required))) {
+    stop("Missing required column in: ", basename(path),
+         "\n  Need OCC_CODE, NAICS, TOT_EMP.",
+         "\n  Found columns: ", paste(names(df), collapse = ", "))
+  }
+
+  out <- df %>%
+    transmute(
+      occ_code    = as.character(.data[[occ_code_col]]),
+      occ_title   = if (!is.na(occ_title_col))   as.character(.data[[occ_title_col]])   else NA_character_,
+      naics       = as.character(.data[[naics_col]]),
+      naics_title = if (!is.na(naics_title_col)) as.character(.data[[naics_title_col]]) else NA_character_,
+      o_group     = if (!is.na(o_group_col))     str_to_lower(as.character(.data[[o_group_col]])) else NA_character_,
+      i_group     = if (!is.na(i_group_col))     str_to_lower(as.character(.data[[i_group_col]])) else NA_character_,
+      tot_emp     = suppressWarnings(as.numeric(.data[[tot_emp_col]]))
+    )
+
+  
+  if (any(!is.na(out$o_group))) {
+    out <- out %>% filter(o_group == "detailed")
+  }
+
+
+  if (any(!is.na(out$i_group))) {
+    out <- out %>% filter(str_detect(i_group, "4.?digit"))
+  } else {
+    # Fallback: NAICS is either bare 4-digit ("3361") or padded to 6 ("336100")
+    out <- out %>%
+      mutate(.naics_str = as.character(naics)) %>%
+      filter(
+        str_detect(.naics_str, "^[0-9]{4}$") |
+          str_detect(.naics_str, "^[0-9]{4}00$")
+      ) %>%
+      select(-.naics_str)
+  }
+
+  out
+}
+
+
+# Loop over files 
+if (!dir.exists(oes_folder)) {
+  stop("Folder does not exist: ", oes_folder,
+       "\n  Update `oes_folder` at the top of this script.")
+}
+
+files <- list.files(
+  oes_folder,
+  pattern = "\\.(xlsx|xls|csv)$",
+  full.names = TRUE,
+  ignore.case = TRUE
+)
+
+if (length(files) == 0) {
+  stop("No .xlsx/.xls/.csv files found in ", oes_folder)
+}
+
+cat("Found", length(files), "candidate file(s) in", oes_folder, ":\n")
+walk(files, ~ cat("  -", basename(.x), "\n"))
+
+panel_list <- list()
+
+for (f in files) {
+  yr <- get_year(basename(f))
+
+  if (is.na(yr) || yr < 2016 || yr > 2024) {
+    message("Skipping (no 2016-2022 year detected in filename): ", basename(f))
+    next
+  }
+
+  cat("\nReading ", basename(f), " (year = ", yr, ") ...\n", sep = "")
+
+  one <- tryCatch(
+    read_one_oes(f),
+    error = function(e) {
+      message("  FAILED: ", e$message)
+      NULL
+    }
+  )
+  if (is.null(one)) next
+
+  one$year <- yr
+  cat("  -> ", nrow(one), " rows kept after detailed/4-digit filters\n", sep = "")
+
+  panel_list[[as.character(yr)]] <- one
+}
+
+if (length(panel_list) == 0) {
+  stop("No files produced usable rows. Check filenames and column names.")
+}
+
+
+# Stack and save 
+panel <- bind_rows(panel_list) %>%
+  arrange(year, naics, occ_code) %>%
+  select(year, naics, naics_title, occ_code, occ_title,
+         tot_emp, o_group, i_group)
+
+cat("\n=== Panel summary ===\n")
+panel %>%
+  group_by(year) %>%
+  summarise(
+    rows         = n(),
+    n_naics      = n_distinct(naics),
+    n_occs       = n_distinct(occ_code),
+    tot_emp_sum  = sum(tot_emp, na.rm = TRUE),
+    n_suppressed = sum(is.na(tot_emp)),
+    .groups = "drop"
+  ) %>%
+  print()
+
+write_csv(panel, employment_csv)
+cat("\nWrote ", nrow(panel), " rows to ", employment_csv, "\n", sep = "")
+```
+

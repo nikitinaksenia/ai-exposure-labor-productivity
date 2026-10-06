@@ -1,0 +1,74 @@
+---
+title: "Merge Employment with AIIE panel"
+date: "2026-04-26"
+output: pdf_document
+---
+
+```{r}
+# ============================================================
+# Merge OES employment panel onto the AIIE / GenAI panel
+library(tidyverse)
+
+
+aiie_path <- "../Data/Intermediate data/generative_ai_aiie_panel_merge.csv"
+oes_path  <- "../Data/Intermediate data/oes_panel_2016_2024.csv"
+out_path  <- "../Data/Intermediate data/genAIIE with empl panel for K.csv"
+
+# Read inputs (force naics to character to avoid type drift) 
+aiie <- read_csv(aiie_path,
+                 col_types = cols(naics = "c", naics4 = "c"))
+
+oes <- read_csv(oes_path,
+                col_types = cols(naics   = "c",
+                                 tot_emp = "d",
+                                 .default = "c"))
+
+
+# 2. Aggregate OES detailed occupations to industry-year totals 
+emp_yr <- oes %>%
+  group_by(year, naics) %>%
+  summarise(employment = sum(tot_emp, na.rm = TRUE), .groups = "drop")
+
+
+aiie   <- aiie   %>% mutate(year = as.integer(year))
+emp_yr <- emp_yr %>% mutate(year = as.integer(year))
+
+# 3. Merge employment onto AIIE panel 
+panel <- aiie %>% left_join(emp_yr, by = c("year", "naics"))
+
+# 4. Build the lag via self-merge on (naics, year - 1) 
+lag_df <- emp_yr %>%
+  mutate(year = year + 1L) %>%
+  rename(employment_lag1 = employment)
+
+panel <- panel %>%
+  left_join(lag_df, by = c("year", "naics")) %>%
+  mutate(
+    employment_pct_chg = (employment - employment_lag1) / employment_lag1 * 100,
+    log_employment     = if_else(!is.na(employment) & employment > 0,
+                                 log(employment),
+                                 NA_real_)
+  ) %>%
+  arrange(naics, year)
+
+# 5. Save 
+write_csv(panel, out_path)
+message("Wrote: ", out_path, "  (", nrow(panel), " rows, ",
+        ncol(panel), " columns)")
+
+# 6. Sanity check (Logging, NAICS 113300, 2014-2022)
+panel %>%
+  filter(naics == "113300", year >= 2014) %>%
+  select(year, naics, employment, employment_lag1,
+         employment_pct_chg, log_employment) %>%
+  print(n = Inf)
+
+# 7. Coverage by year
+panel %>%
+  group_by(year) %>%
+  summarise(n_emp = sum(!is.na(employment)),
+            n_lag = sum(!is.na(employment_lag1))) %>%
+  filter(year >= 2015) %>%
+  print(n = Inf)
+```
+
